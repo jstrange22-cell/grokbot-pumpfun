@@ -95,6 +95,23 @@ def test_terminal_reasons_win_over_temporary(cfg):
 # --- разбор события сокета ------------------------------------------------
 
 
+def pumpportal_create(mint: str = "Mint111", **overrides) -> dict:
+    """Живая форма subscribeNewToken: имя, тикер, uri — без отдельного image."""
+    payload = {
+        "txType": "create",
+        "mint": mint,
+        "name": "Cat Coin",
+        "symbol": "CAT",
+        "uri": "https://ipfs.io/ipfs/QmMetaExample",
+        "traderPublicKey": "Creator1",
+        "vSolInBondingCurve": 30.0,
+        "marketCapSol": 5.0,
+        "timestamp": (time.time() - 300) * 1000,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_parse_create_event():
     token = parse_create_event(
         {
@@ -112,6 +129,43 @@ def test_parse_create_event():
     assert token.mint == "Abc"
     # 30 SOL в резерве виртуальные: реально собрано 8.5
     assert token.curve_progress == pytest.approx(8.5 / CURVE_COMPLETION_SOL)
+
+
+def test_pumpportal_create_without_image_is_not_no_metadata(cfg):
+    """Прод 2026-08-30: 163/163 лончей отсеялись как no_metadata, потому что
+    PumpPortal шлёт name+symbol+uri и не кладёт отдельное поле image."""
+    token = parse_create_event(pumpportal_create())
+    assert token is not None
+    assert token.image_uri is None
+    assert token.metadata_uri == "https://ipfs.io/ipfs/QmMetaExample"
+    assert token.has_metadata
+    token.unique_buyers = 10
+    ok, reason = passes_filter(token, cfg)
+    assert ok and reason == "ok"
+
+
+def test_pumpportal_launches_are_not_all_skipped_as_no_metadata():
+    """Тот же инцидент через буфер монитора: require_metadata остаётся
+    включённым, но пачка лончей без image не должна осыпаться целиком."""
+    skips: list = []
+    config = Config()
+    config.filter = FilterConfig(
+        min_unique_buyers=3,
+        min_age_seconds=120.0,
+        require_metadata=True,
+    )
+    mon = LaunchMonitor(config, on_skip=lambda t, r: skips.append((t.mint, r)))
+    promoted = 0
+    for index in range(20):
+        mint = f"Mint{index}"
+        mon.handle_event(pumpportal_create(mint))
+        out = None
+        for wallet in ("w1", "w2", "w3"):
+            out = mon.handle_event({"txType": "buy", "mint": mint, "traderPublicKey": wallet})
+        if out is not None:
+            promoted += 1
+    assert promoted == 20
+    assert skips == []
 
 
 def test_fresh_launch_has_zero_progress():
@@ -337,6 +391,93 @@ async def test_stream_reconnects_after_drop(monkeypatch):
 
     assert token.mint == "B"
     assert len(opened) == 2          # первый коннект упал, второй сработал
+
+
+async def test_stream_does_not_fetch_when_name_is_present(monkeypatch):
+    """Обычный PumpPortal-лонч (есть name+uri) не ходит в сеть за JSON."""
+    created = (time.time() - 300) * 1000
+    called: list[str] = []
+
+    async def fake_fetch(uri: str, timeout: float = 10.0, client=None):
+        called.append(uri)
+        return {}
+
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "fetch_offchain_metadata", fake_fetch)
+
+    ws = FakeWebSocket([
+        pumpportal_create("A", timestamp=created),
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w1"},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w2"},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w3"},
+    ])
+    patch_socket(monkeypatch, [ws])
+
+    mon = make_monitor([])
+    stream = mon.stream()
+    token = await asyncio.wait_for(stream.__anext__(), timeout=2)
+    await stream.aclose()
+
+    assert token.mint == "A"
+    assert token.name == "Cat Coin"
+    assert called == []
+
+
+async def test_stream_enriches_nameless_create_from_uri(monkeypatch):
+    """Сокет без name, но с uri: монитор читает JSON по uri, не data.api_key."""
+    created = (time.time() - 300) * 1000
+    seen_uris: list[str] = []
+
+    async def fake_fetch(uri: str, timeout: float = 10.0, client=None):
+        seen_uris.append(uri)
+        return {"name": "From URI", "symbol": "URI", "image": "https://img/from-uri.png"}
+
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "fetch_offchain_metadata", fake_fetch)
+
+    ws = FakeWebSocket([
+        {"txType": "create", "mint": "A", "uri": "https://ipfs.io/ipfs/QmOnlyUri",
+         "timestamp": created},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w1"},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w2"},
+        {"txType": "buy", "mint": "A", "traderPublicKey": "w3"},
+    ])
+    patch_socket(monkeypatch, [ws])
+
+    mon = make_monitor([])
+    stream = mon.stream()
+    token = await asyncio.wait_for(stream.__anext__(), timeout=2)
+    await stream.aclose()
+
+    assert token.mint == "A"
+    assert token.name == "From URI"
+    assert token.image_uri == "https://img/from-uri.png"
+    assert seen_uris == ["https://ipfs.io/ipfs/QmOnlyUri"]
+
+
+async def test_nameless_create_stays_no_metadata_if_uri_fetch_fails(monkeypatch):
+    """Нет имени и JSON по uri не открылся — отказ, а не пропуск фильтра."""
+    created = (time.time() - 300) * 1000
+
+    async def fake_fetch(uri: str, timeout: float = 10.0, client=None):
+        return {}
+
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "fetch_offchain_metadata", fake_fetch)
+
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.handle_event(
+        {"txType": "create", "mint": "A", "uri": "https://ipfs.io/ipfs/QmMissing",
+         "timestamp": created}
+    )
+    await mon.enrich_from_uri(mon.pending["A"])
+    for wallet in ("w1", "w2", "w3"):
+        mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": wallet})
+    assert skips == [("A", "no_metadata")]
 
 
 async def test_stream_survives_broken_json(monkeypatch):

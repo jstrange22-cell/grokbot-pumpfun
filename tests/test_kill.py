@@ -37,5 +37,6 @@ def test_atlas_config_is_dry_run_with_caps():
     assert cfg.risk.max_trades_per_day == 10
     assert cfg.ops.health_port == 8080
     assert cfg.ops.health_host == "127.0.0.1"
+    assert cfg.filter.require_metadata is True
     errors, _ = cfg.problems()
     assert any("grok.api_key" in e for e in errors)

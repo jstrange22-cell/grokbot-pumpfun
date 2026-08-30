@@ -10,10 +10,13 @@ import pytest
 
 from src.analyzer import (
     Analyzer,
+    apply_offchain_metadata,
     compute_metrics,
     enrich_token,
+    fetch_offchain_metadata,
     parse_holder,
     parse_trade,
+    resolve_metadata_url,
 )
 from src.models import Config, Holder, Token, Trade
 
@@ -115,6 +118,42 @@ def test_enrich_fills_only_missing_fields():
     assert tok.description == "уже есть"
     assert tok.twitter == "https://x.com/c"
     assert tok.sol_in_curve == 30.0
+
+
+def test_resolve_ipfs_uri():
+    assert resolve_metadata_url("ipfs://QmCid/meta.json") == "https://ipfs.io/ipfs/QmCid/meta.json"
+    assert resolve_metadata_url("https://arweave.net/x") == "https://arweave.net/x"
+
+
+def test_apply_offchain_metadata_fills_name_and_image():
+    tok = token(name=None, image_uri=None)
+    apply_offchain_metadata(tok, {
+        "name": "From URI",
+        "symbol": "URI",
+        "image": "https://img/from-uri.png",
+        "description": "метаданные с ipfs",
+    })
+    assert tok.name == "From URI"
+    assert tok.symbol == "URI"
+    assert tok.image_uri == "https://img/from-uri.png"
+    assert tok.has_metadata
+
+
+async def test_fetch_offchain_metadata_has_no_api_key():
+    """Монитор не должен тащить data.api_key на публичный JSON по uri."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("authorization", ""))
+        assert request.url.path == "/ipfs/QmMeta"
+        return httpx.Response(200, json={"name": "Offchain", "image": "https://i"})
+
+    data = await fetch_offchain_metadata(
+        "ipfs://QmMeta",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    assert data["name"] == "Offchain"
+    assert seen == [""]
 
 
 # --- метрики --------------------------------------------------------------
