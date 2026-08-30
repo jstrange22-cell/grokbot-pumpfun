@@ -7,6 +7,14 @@
 Свежесозданный токен не может пройти фильтр по возрасту, поэтому лончи
 кладутся в буфер `pending`, накапливают сделки из того же сокета и
 проверяются повторно, когда дорастут до `min_age_seconds`.
+
+Покупателей берём из ленты сделок, не из create. `subscribeNewToken`
+бесплатный и живой; `subscribeTokenTrade` у PumpPortal платный и, если
+слать по одному минту, каждый вызов подменяет предыдущий список ключей.
+Без живых buy-событий `unique_buyers` остаётся 0, и через TTL всё
+осыпается как `stale_no_traction` — так и было на ATLAS 2026-08-30.
+Поэтому подписка на сделки всегда шлёт текущий буфер целиком, а если
+сокет молчит — раз в несколько секунд добираем покупателей публичным REST.
 """
 
 from __future__ import annotations
@@ -17,18 +25,27 @@ import json
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+import httpx
 import websockets
 
-from .analyzer import apply_offchain_metadata, fetch_offchain_metadata
+from .analyzer import apply_offchain_metadata, enrich_token, fetch_offchain_metadata, parse_trade
 from .curve import CURVE_COMPLETION_SOL, progress_from_sol
-from .models import Config, FilterConfig, Token
+from .models import Config, FilterConfig, Token, is_placeholder
 
 log = logging.getLogger(__name__)
 
-__all__ = ["CURVE_COMPLETION_SOL", "LaunchMonitor", "parse_create_event", "passes_filter"]
+__all__ = [
+    "CURVE_COMPLETION_SOL",
+    "LaunchMonitor",
+    "data_socket_url",
+    "monitor_detail",
+    "parse_create_event",
+    "passes_filter",
+]
 
 # Сколько держать лонч в буфере, если он так и не набрал покупателей.
 PENDING_TTL_SECONDS = 900.0
@@ -37,6 +54,18 @@ PENDING_TTL_SECONDS = 900.0
 # без ограничения и буфер, и список уже виденных растут без конца.
 MAX_PENDING = 2_000
 MAX_REMEMBERED = 20_000
+
+# PumpPortal подменяет список ключей целиком. Шлём пачку, не по одному.
+MAX_TRADE_SUBS = 400
+
+# REST-добор, когда сокет сделок молчит. Только дозревшие, с паузой
+# между опросами одного минта — иначе 200 pending съедят лимит.
+REST_REFRESH_SECONDS = 30.0
+REST_BATCH = 12
+REST_TRADE_LIMIT = 80
+
+
+RestFetch = Callable[[str], Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]]]
 
 
 class SeenSet:
@@ -59,11 +88,60 @@ class SeenSet:
         return len(self._items)
 
 
+def data_socket_url(config: Config) -> str:
+    """URL сокета. Ключ PumpPortal — в query, не в лог и не в yaml.
+
+    `subscribeTokenTrade` у них с 2026 требует `?api-key=`. Плейсхолдер
+    не подставляем: это не ключ, а мусор в query.
+    """
+    url = config.data.ws_url
+    key = config.data.key
+    if not key or is_placeholder(key):
+        return url
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if query.get("api-key"):
+        return url
+    query["api-key"] = key
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def monitor_detail(token: Token) -> str:
+    """Почему монитор так решил — в одну строку для JSONL `detail`."""
+    return (
+        f"buyers={token.unique_buyers} "
+        f"age={round(token.age_seconds)}s "
+        f"curve={token.curve_progress:.3f}"
+    )
+
+
+def _event_mint(payload: dict[str, Any]) -> str | None:
+    mint = payload.get("mint") or payload.get("mintAddress") or payload.get("ca")
+    return str(mint) if mint else None
+
+
+def _event_wallet(payload: dict[str, Any]) -> str | None:
+    wallet = (
+        payload.get("traderPublicKey")
+        or payload.get("wallet")
+        or payload.get("user")
+        or payload.get("trader")
+    )
+    return str(wallet) if wallet else None
+
+
+def _is_buy_event(payload: dict[str, Any]) -> bool:
+    tx_type = str(payload.get("txType") or payload.get("tx_type") or "").lower()
+    if tx_type == "buy":
+        return True
+    return payload.get("is_buy") is True or payload.get("isBuy") is True
+
+
 def parse_create_event(payload: dict[str, Any]) -> Token | None:
     """Событие создания токена -> Token. None, если событие не про создание."""
     if payload.get("txType") not in ("create", "created"):
         return None
-    mint = payload.get("mint") or payload.get("mintAddress")
+    mint = _event_mint(payload)
     if not mint:
         return None
 
@@ -121,6 +199,7 @@ class LaunchMonitor:
         self,
         config: Config,
         on_skip: Callable[[Token, str], None] | None = None,
+        rest_fetch: RestFetch | None = None,
     ) -> None:
         self.config = config
         self.filter = config.filter
@@ -128,6 +207,11 @@ class LaunchMonitor:
         self.pending: dict[str, Token] = {}
         self._buyers: dict[str, set[str]] = {}
         self._emitted = SeenSet()
+        self._rest_fetch = rest_fetch
+        self._last_rest: dict[str, float] = {}
+        # 0 = событий ещё не было. Пайплайн считает stall по max(своего
+        # таймера, этого): create/skip тоже живость, не только promote.
+        self.last_message_at: float = 0.0
 
     # -- обработка событий -------------------------------------------------
 
@@ -136,6 +220,7 @@ class LaunchMonitor:
         tx_type = payload.get("txType")
 
         if tx_type in ("create", "created"):
+            self.last_message_at = time.time()
             token = parse_create_event(payload)
             if token and token.mint not in self._emitted:
                 self._evict_if_crowded()
@@ -145,13 +230,17 @@ class LaunchMonitor:
                 self._buyers[token.mint] = set()
             return None
 
-        mint = payload.get("mint")
+        mint = _event_mint(payload)
         if not mint or mint not in self.pending:
             return None
 
-        token = self.pending[mint]
-        wallet = payload.get("traderPublicKey") or payload.get("wallet")
-        if tx_type == "buy" and wallet:
+        self.last_message_at = time.time()
+        return self._apply_market_event(self.pending[mint], payload)
+
+    def _apply_market_event(self, token: Token, payload: dict[str, Any]) -> Token | None:
+        mint = token.mint
+        wallet = _event_wallet(payload)
+        if _is_buy_event(payload) and wallet and wallet != token.creator:
             self._buyers[mint].add(wallet)
         token.unique_buyers = len(self._buyers[mint])
 
@@ -211,9 +300,95 @@ class LaunchMonitor:
                     self.on_skip(token, "stale_no_traction")
         return ready
 
+    async def refresh_from_rest(self, now: float | None = None) -> None:
+        """Добрать покупателей и кривую, если сокет сделок молчит.
+
+        Публичный `data.rest_url`, без PumpPortal api-key: карточка и
+        сделки frontend-api. Только токены старше min_age, у которых
+        ещё не набралось покупателей. Сбой — тишина, не промоут.
+        """
+        now = now or time.time()
+        due = [
+            token
+            for token in self.pending.values()
+            if token.age_seconds >= self.filter.min_age_seconds
+            and token.unique_buyers < self.filter.min_unique_buyers
+            and now - self._last_rest.get(token.mint, 0.0) >= REST_REFRESH_SECONDS
+        ]
+        due.sort(key=lambda token: token.created_timestamp)
+        due = due[:REST_BATCH]
+        if not due:
+            return
+
+        fetcher = self._rest_fetch or self._default_rest_fetch
+        for token in due:
+            self._last_rest[token.mint] = now
+            try:
+                trades_raw, info = await fetcher(token.mint)
+            except Exception as exc:
+                log.warning("REST-добор %s не удался: %s", token.mint[:8], exc)
+                continue
+            self._apply_rest_snapshot(token, trades_raw, info)
+
+    def _apply_rest_snapshot(
+        self,
+        token: Token,
+        trades_raw: list[dict[str, Any]] | None,
+        info: dict[str, Any] | None,
+    ) -> None:
+        if info:
+            enrich_token(token, info)
+            if info.get("complete"):
+                token.curve_progress = 1.0
+            elif token.sol_in_curve:
+                token.curve_progress = progress_from_sol(token.sol_in_curve)
+
+        buyers = self._buyers.setdefault(token.mint, set())
+        for raw in trades_raw or []:
+            if not isinstance(raw, dict):
+                continue
+            trade = parse_trade(raw)
+            if trade.is_buy and trade.wallet and trade.wallet != token.creator:
+                buyers.add(trade.wallet)
+        token.unique_buyers = len(buyers)
+
+    async def _default_rest_fetch(
+        self, mint: str
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        base = self.config.data.rest_url.rstrip("/")
+        timeout = self.config.data.request_timeout
+        headers = {"Accept": "application/json"}
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            trades_raw: list[dict[str, Any]] = []
+            info: dict[str, Any] = {}
+            try:
+                resp = await client.get(
+                    f"{base}/trades/all/{mint}", params={"limit": REST_TRADE_LIMIT}
+                )
+                if resp.is_success:
+                    body = resp.json()
+                    if isinstance(body, list):
+                        trades_raw = [row for row in body if isinstance(row, dict)]
+                    elif isinstance(body, dict):
+                        rows = body.get("trades") or body.get("data") or []
+                        if isinstance(rows, list):
+                            trades_raw = [row for row in rows if isinstance(row, dict)]
+            except Exception as exc:
+                log.warning("REST сделки %s: %s", mint[:8], exc)
+            try:
+                resp = await client.get(f"{base}/coins/{mint}")
+                if resp.is_success:
+                    body = resp.json()
+                    if isinstance(body, dict):
+                        info = body
+            except Exception as exc:
+                log.warning("REST карточка %s: %s", mint[:8], exc)
+        return trades_raw, info
+
     def _forget(self, mint: str) -> None:
         self.pending.pop(mint, None)
         self._buyers.pop(mint, None)
+        self._last_rest.pop(mint, None)
 
     def _evict_if_crowded(self) -> None:
         """Буфер переполнен — выкидываем самые старые недозревшие лончи."""
@@ -233,8 +408,12 @@ class LaunchMonitor:
         backoff = 1.0
         while True:
             try:
-                async with websockets.connect(self.config.data.ws_url) as ws:
+                socket_url = data_socket_url(self.config)
+                async with websockets.connect(socket_url) as ws:
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                    # Ключи — весь текущий буфер. Один минт в сообщении
+                    # затирал бы предыдущую подписку: buy-события не доходили.
+                    await self._sync_trade_subs(ws)
                     log.info("монитор подключён к %s", self.config.data.ws_url)
                     backoff = 1.0
                     last_sweep = time.time()
@@ -251,19 +430,23 @@ class LaunchMonitor:
                             if isinstance(payload, dict):
                                 token = self.handle_event(payload)
                                 if token is not None:
-                                    await self._subscribe_trades(ws, token.mint, off=True)
                                     yield token
                                 elif payload.get("txType") in ("create", "created"):
-                                    mint = payload.get("mint") or payload.get("mintAddress")
+                                    mint = _event_mint(payload)
                                     pending = self.pending.get(mint) if mint else None
                                     if pending is not None:
                                         await self.enrich_from_uri(pending)
-                                    if mint:
-                                        await self._subscribe_trades(ws, mint)
+                                    await self._sync_trade_subs(ws)
+                                elif payload.get("message") or payload.get("error"):
+                                    # Отказ PumpPortal (нет api-key и т.п.) —
+                                    # не событие рынка, но его надо видеть.
+                                    log.warning("сокет: %s", payload)
                         if time.time() - last_sweep >= sweeper_delay:
                             last_sweep = time.time()
+                            await self.refresh_from_rest()
                             for token in self.sweep():
                                 yield token
+                            await self._sync_trade_subs(ws)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # обрыв сокета — ждём и переподключаемся
@@ -272,8 +455,14 @@ class LaunchMonitor:
                     await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60.0)
 
-    @staticmethod
-    async def _subscribe_trades(ws: Any, mint: str, off: bool = False) -> None:
-        method = "unsubscribeTokenTrade" if off else "subscribeTokenTrade"
+    async def _sync_trade_subs(self, ws: Any) -> None:
+        """Подписать сокет на сделки по всему буферу, не по последнему минту."""
+        if not self.pending:
+            return
+        mints = sorted(
+            self.pending,
+            key=lambda mint: self.pending[mint].created_timestamp,
+            reverse=True,
+        )[:MAX_TRADE_SUBS]
         with contextlib.suppress(Exception):
-            await ws.send(json.dumps({"method": method, "keys": [mint]}))
+            await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": mints}))

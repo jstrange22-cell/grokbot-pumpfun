@@ -1,10 +1,12 @@
 """JSONL-логирование. Одна запись — одна строка.
 
-Три типа записей:
-  buy   — покупка, с полным контекстом решения (скоринг, оценки всех
-          агентов, метрики, цена входа);
-  skip  — токен не прошёл, с указанием ступени, причины и детали;
-  close — закрытие позиции с PnL и временем удержания.
+Типы записей:
+  promote — монитор отдал токен дальше (ещё не покупка, уже не skip);
+  intent  — намерение купить, до отправки транзакции;
+  buy     — покупка, с полным контекстом решения (скоринг, оценки всех
+            агентов, метрики, цена входа);
+  skip    — токен не прошёл, с указанием ступени, причины и детали;
+  close   — закрытие позиции с PnL и временем удержания.
 
 Лог — единственный источник правды о том, что пайплайн делал и почему.
 Скоринг пишется разложенным по компонентам: без этого потом не понять,
@@ -161,6 +163,27 @@ class TradeLog:
             "size_sol": round(size_sol, 6),
             "score": analysis.scores.total,
         })
+
+    def promote(self, token: Token, *, detail: str | None = None) -> dict[str, Any]:
+        """Лонч прошёл монитор. Дальше — анализатор и, если повезёт, Grok."""
+        return self._write(
+            {
+                "type": "promote",
+                "mint": token.mint,
+                "symbol": token.symbol,
+                "name": token.name,
+                "stage": "monitor",
+                "reason": "ok",
+                "detail": detail,
+                "token": {
+                    "age_seconds": round(token.age_seconds),
+                    "unique_buyers": token.unique_buyers,
+                    "curve_progress": round(token.curve_progress, 4),
+                    "market_cap_sol": round(token.market_cap_sol, 4),
+                    "creator": token.creator,
+                },
+            }
+        )
 
     def skip(
         self,

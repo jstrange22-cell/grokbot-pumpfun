@@ -71,6 +71,7 @@ def main() -> int:
     buys = [r for r in records if r.get("type") == "buy"]
     skips = [r for r in records if r.get("type") == "skip"]
     closes = [r for r in records if r.get("type") == "close"]
+    promotes = [r for r in records if r.get("type") == "promote"]
 
     span_start = min(r.get("ts", 0) for r in records)
     span_end = max(r.get("ts", 0) for r in records)
@@ -85,6 +86,7 @@ def main() -> int:
 
     seen = len(buys) + len(skips)
     print(f"\nТокенов рассмотрено: {seen}")
+    print(f"  промоут:   {len(promotes)}")
     print(f"  куплено:   {len(buys)}")
     print(f"  пропущено: {len(skips)}")
     if seen:

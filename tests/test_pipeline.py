@@ -312,6 +312,40 @@ async def test_status_degrades_when_stream_stalls(config):
     assert status["status"] == "degraded"
 
 
+def test_monitor_skip_logs_detail_and_counts_as_liveness(config):
+    """Прод: skip.detail был null, а healthz висел unhealthy, потому что
+    skip не считался событием. Create/skip — это живость сокета."""
+    pipeline = Pipeline(config)
+    pipeline._last_event_at -= 10_000
+    token = fresh_token()
+    token.unique_buyers = 2
+    token.curve_progress = 0.08
+    pipeline._log_monitor_skip(token, "stale_no_traction")
+
+    records = list(read_log(config.logging.path))
+    assert records[0]["type"] == "skip"
+    assert records[0]["stage"] == "monitor"
+    assert records[0]["reason"] == "stale_no_traction"
+    assert "buyers=2" in records[0]["detail"]
+    assert "curve=0.080" in records[0]["detail"]
+    assert "age=" in records[0]["detail"]
+    assert pipeline.status()["stalled"] is False
+
+
+def test_monitor_promote_log_line(config):
+    pipeline = Pipeline(config)
+    token = fresh_token()
+    token.unique_buyers = 7
+    token.curve_progress = 0.15
+    pipeline._log_monitor_promote(token)
+    records = list(read_log(config.logging.path))
+    assert records[0]["type"] == "promote"
+    assert records[0]["mode"] == "dry-run"
+    assert records[0]["reason"] == "ok"
+    assert records[0]["token"]["unique_buyers"] == 7
+    assert "buyers=7" in records[0]["detail"]
+
+
 async def test_metrics_count_stages(config):
     pipeline = Pipeline(config)
     wire(pipeline, REJECT)
@@ -438,7 +472,7 @@ async def test_serve_runs_then_stops_cleanly(config):
 
     saved = StateStore(config.ops.state_path).load()
     assert saved is not None and "Mint1111" in saved.positions
-    assert [r["type"] for r in read_log(config.logging.path)] == ["intent", "buy"]
+    assert [r["type"] for r in read_log(config.logging.path)] == ["promote", "intent", "buy"]
 
 
 # --- память о создателях --------------------------------------------------

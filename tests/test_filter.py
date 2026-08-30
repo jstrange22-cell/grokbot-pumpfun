@@ -367,8 +367,10 @@ async def test_stream_yields_matured_token(monkeypatch):
     assert token.mint == "A"
     methods = [m["method"] for m in ws.sent]
     assert methods[0] == "subscribeNewToken"
-    assert "subscribeTokenTrade" in methods       # подписались на сделки лонча
-    assert "unsubscribeTokenTrade" in methods     # и отписались, когда отдали
+    trade_subs = [m for m in ws.sent if m.get("method") == "subscribeTokenTrade"]
+    assert trade_subs
+    assert "A" in trade_subs[-1]["keys"]          # буфер целиком, не один минт
+    assert "unsubscribeTokenTrade" not in methods  # отписка по одному затирала бы ленту
 
 
 async def test_stream_reconnects_after_drop(monkeypatch):
@@ -504,3 +506,125 @@ async def test_stream_survives_broken_json(monkeypatch):
     token = await asyncio.wait_for(stream.__anext__(), timeout=2)
     await stream.aclose()
     assert token.mint == "C"
+
+
+def test_data_socket_url_appends_real_key_only():
+    from src.monitor import data_socket_url
+
+    config = Config()
+    config.data.ws_url = "wss://pumpportal.fun/api/data"
+    config.data.api_key = "YOUR-DATA-PROVIDER-KEY"
+    assert data_socket_url(config) == "wss://pumpportal.fun/api/data"
+
+    config.data.api_key = "pp-live-key-123"
+    assert data_socket_url(config) == "wss://pumpportal.fun/api/data?api-key=pp-live-key-123"
+
+
+def test_monitor_detail_names_buyers_age_curve():
+    from src.monitor import monitor_detail
+
+    token = make_token(unique_buyers=3, curve_progress=0.12,
+                       created_timestamp=time.time() - 180)
+    detail = monitor_detail(token)
+    assert "buyers=3" in detail
+    assert "age=180s" in detail or "age=181s" in detail
+    assert "curve=0.120" in detail
+
+
+async def test_trade_subscribe_sends_whole_pending_buffer():
+    """Один subscribeTokenTrade с одним минтом затирает предыдущий список.
+    На живой ленте это оставляло unique_buyers=0 у всего буфера."""
+    skips: list = []
+    mon = make_monitor(skips)
+    created = (time.time() - 300) * 1000
+    mon.handle_event(pumpportal_create("Old", timestamp=created))
+    mon.handle_event(pumpportal_create("New", timestamp=created))
+
+    sent: list[dict] = []
+
+    class Recorder:
+        async def send(self, raw: str) -> None:
+            sent.append(json.loads(raw))
+
+    await mon._sync_trade_subs(Recorder())
+    assert sent[0]["method"] == "subscribeTokenTrade"
+    assert set(sent[0]["keys"]) == {"Old", "New"}
+
+
+def test_buy_alias_fields_count_and_exclude_creator():
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.handle_event(pumpportal_create("A", timestamp=(time.time() - 300) * 1000))
+    mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": "Creator1"})
+    mon.handle_event({"txType": "Buy", "ca": "A", "user": "w1"})
+    mon.handle_event({"tx_type": "buy", "mintAddress": "A", "wallet": "w2", "isBuy": True})
+    out = mon.handle_event({"is_buy": True, "mint": "A", "trader": "w3"})
+    assert out is not None
+    assert out.unique_buyers == 3
+
+
+async def test_rest_snapshot_promotes_when_socket_trades_never_arrive():
+    """Прод 2026-08-30: 10047/10580 skip = stale_no_traction, few_buyers=0.
+    Сокет create живой, buy-событий нет. REST должен добрать покупателей."""
+    skips: list = []
+    config = Config()
+    config.filter = FilterConfig(
+        min_unique_buyers=5,
+        min_age_seconds=120.0,
+        require_metadata=True,
+        max_curve_progress=0.40,
+    )
+
+    async def fake_rest(mint: str):
+        trades = [{"user": f"w{i}", "txType": "buy"} for i in range(5)]
+        return trades, {"virtual_sol_reserves": 32_000_000_000, "complete": False}
+
+    mon = LaunchMonitor(config, on_skip=lambda t, r: skips.append((t.mint, r)),
+                        rest_fetch=fake_rest)
+    mon.handle_event(pumpportal_create("A", timestamp=(time.time() - 180) * 1000))
+    assert mon.handle_event({"txType": "sell", "mint": "A", "wallet": "x"}) is None
+    assert mon.pending["A"].unique_buyers == 0
+
+    await mon.refresh_from_rest()
+    ready = mon.sweep()
+    assert [t.mint for t in ready] == ["A"]
+    assert ready[0].unique_buyers == 5
+    assert ready[0].has_metadata
+    assert ready[0].image_uri is None
+    assert skips == []
+
+
+async def test_rest_does_not_promote_nameless_or_full_curve():
+    skips: list = []
+    config = Config()
+    config.filter = FilterConfig(min_unique_buyers=5, min_age_seconds=120.0)
+
+    async def fake_rest(mint: str):
+        return [{"user": f"w{i}", "txType": "buy"} for i in range(8)], {"complete": True}
+
+    mon = LaunchMonitor(config, on_skip=lambda t, r: skips.append((t.mint, r)),
+                        rest_fetch=fake_rest)
+    mon.handle_event(pumpportal_create("A", timestamp=(time.time() - 180) * 1000))
+    await mon.refresh_from_rest()
+    assert mon.sweep() == []
+    assert skips == [("A", "curve_too_full")]
+
+
+def test_atlas_filter_promotes_pumpportal_create_without_image():
+    """Живая форма create + 5 чужих покупок. Картинки нет — это не no_metadata."""
+    config = Config()
+    config.filter = FilterConfig(
+        min_unique_buyers=5,
+        max_curve_progress=0.40,
+        require_metadata=True,
+        min_age_seconds=120.0,
+    )
+    mon = LaunchMonitor(config)
+    mon.handle_event(pumpportal_create("A", timestamp=(time.time() - 200) * 1000))
+    out = None
+    for wallet in ("w1", "w2", "w3", "w4", "w5"):
+        out = mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": wallet})
+    assert out is not None
+    assert out.unique_buyers == 5
+    assert out.image_uri is None
+    assert out.has_metadata
