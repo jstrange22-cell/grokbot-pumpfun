@@ -3,6 +3,28 @@
 Формат: что изменилось и почему это имело значение. Версии — по смыслу, а
 не по расписанию.
 
+## 0.4.3 — 2026-08-30
+
+- **Analyzer skipped every promote as `no_trade_data`.** After 0.4.2 the
+  monitor correctly promoted tokens with 5–161 WebSocket buyers, then the
+  analyzer called `frontend-api.pump.fun` (`/coins/{mint}`, holders,
+  `/trades/all/{mint}`). That host is Cloudflare 1016 / HTTP 530.
+  `frontend-api-v3.pump.fun /coins/{mint}` is public and returns
+  `virtual_sol_reserves` / `market_cap` / `complete`. v3 `/trades` and
+  `/holders` are 404 without a pump.fun site JWT — PumpPortal
+  `data.api_key` is not that JWT and is no longer sent as `Authorization`.
+  Default `data.rest_url` is now v3. A 530/429 on the configured host hops
+  to the other known frontends. Empty REST trades no longer veto when
+  `token.unique_buyers >= filter.min_unique_buyers`. Empty REST coin no
+  longer forces `curve_too_thin` if the token already has enough
+  `sol_in_curve` / `market_cap_sol`. Live (and dry-run via the shared
+  helper) restore the curve from those fields; live also reads on-chain
+  bonding-curve reserves when the card is thin, so a REST outage cannot
+  block a fill after Grok approves.
+- Monitor gates and ATLAS risk caps are unchanged
+  (`min_unique_buyers=5`, `min_age_seconds=120`, `max_curve_progress=0.40`,
+  `max_sol_per_trade=0.05`, `max_open_positions=1`, daily 0.1).
+
 ## 0.4.2 — 2026-08-30
 
 - **Dry-run monitor never promoted.** After the metadata fix, ~10k

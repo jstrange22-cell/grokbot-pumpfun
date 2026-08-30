@@ -33,8 +33,8 @@ import httpx
 
 from .agents import AuditorAgent, CheckerAgent, NarrativeAgent, TimingAgent
 from .alerts import Notifier
-from .analyzer import Analyzer, compute_metrics, enrich_token
-from .curve import max_sol_for_impact, state_from_any
+from .analyzer import Analyzer
+from .curve import max_sol_for_impact
 from .executor import BaseExecutor, build_executor, new_position
 from .kill import is_killed, kill_file_path
 from .log import TradeLog, read_log, setup_logging
@@ -296,16 +296,11 @@ class Pipeline:
                                 reason="creator_blocked", detail=blocked)
 
         # 2. Анализатор: сеть параллельно, метрики кодом.
-        info, holders, trades = await self.analyzer.fetch(token.mint)
-        enrich_token(token, info)
-        curve = state_from_any(info, token.market_cap_sol)
-        metrics = compute_metrics(
-            token, holders, trades, curve, self.config.market,
-            planned_sol=self.config.risk.max_sol_per_trade,
-        )
+        # Пустой REST-tape не вето, если монитор уже набрал unique_buyers.
+        holders, trades, curve, metrics = await self.analyzer.inspect(token)
         analysis = Analysis(token=token, metrics=metrics, curve=curve)
 
-        ok, reason = self.analyzer.passes(metrics)
+        ok, reason = self.analyzer.passes(metrics, token)
         if not ok:
             return self._reject(analysis, stage="analyzer", reason=reason,
                                 detail=f"risk_score={metrics.risk_score}")

@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 
-from .curve import CurveState, round_trip_cost_pct, state_from_any
+from .curve import CurveState, real_sol_from_hint, round_trip_cost_pct, state_from_any
 from .models import Config, Holder, MarketConfig, Token, TokenMetrics, Trade
 
 log = logging.getLogger(__name__)
@@ -28,12 +28,98 @@ SNIPER_WINDOW_SECONDS = 15.0
 TRADE_LIMIT = 200
 HOLDER_LIMIT = 50
 
+# v1 (frontend-api) — Cloudflare 1016 / HTTP 530 на 2026-08-30.
+# v3 /coins/{mint} живой и публичный. /trades и /holders на v3 отдают 404
+# без JWT сайта; ключ PumpPortal — не этот JWT, его сюда не кладём.
+PUMP_REST_HOSTS = (
+    "https://frontend-api-v3.pump.fun",
+    "https://frontend-api.pump.fun",
+    "https://frontend-api-v2.pump.fun",
+)
+RETRYABLE_STATUS = frozenset({
+    408, 425, 429, 500, 502, 503, 504,
+    520, 521, 522, 523, 524, 525, 526, 530,
+})
+
 # Безусловные вето. Взвешенная сумма их размывает: токен с создателем на
 # четверти предложения набирал приемлемый риск за счёт хорошей кривой и
 # живых соцсетей. Такие условия не компенсируются ничем, поэтому они
 # выставляют максимальный риск, а не прибавляют к нему.
 CREATOR_SHARE_VETO = 0.25
 TOP5_SHARE_VETO = 0.80
+
+
+def rest_base_urls(primary: str) -> tuple[str, ...]:
+    """Primary first, then the known public pump.fun frontends, no dupes."""
+    ordered: list[str] = []
+    for url in (primary, *PUMP_REST_HOSTS):
+        cleaned = (url or "").strip().rstrip("/")
+        if cleaned and cleaned not in ordered:
+            ordered.append(cleaned)
+    return tuple(ordered)
+
+
+def client_primary_url(client: httpx.AsyncClient | None, configured: str) -> str:
+    """Injected test client keeps its base_url; otherwise the config host."""
+    if client is None:
+        return configured
+    raw = str(client.base_url or "").rstrip("/")
+    if raw in ("", "http://", "https://"):
+        return configured
+    return raw
+
+
+def rows_from_payload(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return [row for row in raw if isinstance(row, dict)]
+    if isinstance(raw, dict):
+        rows = raw.get("trades") or raw.get("data") or raw.get("holders") or []
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    return []
+
+
+async def fetch_json(
+    client: httpx.AsyncClient,
+    path: str,
+    hosts: tuple[str, ...],
+    *,
+    retry_empty: bool = False,
+    **params: Any,
+) -> Any:
+    """GET path on each host. Logs path and status only — never headers or keys.
+
+    530/429/5xx hop to the next host. 404 is empty for this path (v3 /trades
+    and /holders without a site JWT) and does not hop: the dead v1 host
+    would only add latency. Empty `{}` on a coin card does hop.
+    """
+    suffix = path if path.startswith("/") else f"/{path}"
+    for host in hosts:
+        url = f"{host}{suffix}"
+        try:
+            resp = await client.get(url, params=params)
+        except Exception as exc:
+            log.warning("запрос %s не удался: %s", path, exc)
+            continue
+        if resp.status_code in RETRYABLE_STATUS:
+            log.warning("запрос %s -> %s", path, resp.status_code)
+            continue
+        if resp.status_code == 404:
+            log.warning("запрос %s -> 404", path)
+            return None
+        if not resp.is_success:
+            log.warning("запрос %s -> %s", path, resp.status_code)
+            continue
+        try:
+            data = resp.json()
+        except Exception as exc:
+            log.warning("запрос %s не JSON: %s", path, exc)
+            continue
+        if retry_empty and not data:
+            log.warning("запрос %s пустой, пробуем запасной хост", path)
+            continue
+        return data
+    return None
 
 
 class Analyzer:
@@ -47,13 +133,12 @@ class Analyzer:
 
     async def __aenter__(self) -> Analyzer:
         if self._client is None:
-            headers = {"Accept": "application/json"}
-            if self.data.key:
-                headers["Authorization"] = f"Bearer {self.data.key}"
+            # Не Bearer: data.api_key — ключ PumpPortal, не JWT pump.fun.
+            # На v3 он не открывает /trades, а в логах светить его незачем.
             self._client = httpx.AsyncClient(
                 base_url=self.data.rest_url,
                 timeout=self.data.request_timeout,
-                headers=headers,
+                headers={"Accept": "application/json"},
             )
         return self
 
@@ -70,44 +155,72 @@ class Analyzer:
 
     # -- сеть --------------------------------------------------------------
 
-    async def _get(self, path: str, **params: Any) -> Any:
-        try:
-            resp = await self.client.get(path, params=params)
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as exc:
-            log.warning("запрос %s не удался: %s", path, exc)
-            return None
+    def _hosts(self) -> tuple[str, ...]:
+        return rest_base_urls(client_primary_url(self._client, self.data.rest_url))
+
+    async def _get(self, path: str, *, retry_empty: bool = False, **params: Any) -> Any:
+        return await fetch_json(
+            self.client, path, self._hosts(), retry_empty=retry_empty, **params,
+        )
 
     async def fetch(self, mint: str) -> tuple[dict[str, Any], list[Holder], list[Trade]]:
         """Карточка, холдеры и сделки — тремя параллельными запросами."""
         info, holders_raw, trades_raw = await asyncio.gather(
-            self._get(f"/coins/{mint}"),
+            self._get(f"/coins/{mint}", retry_empty=True),
             self._get(f"/coins/{mint}/holders", limit=HOLDER_LIMIT),
             self._get(f"/trades/all/{mint}", limit=TRADE_LIMIT),
         )
         return (
-            info or {},
-            [parse_holder(h) for h in (holders_raw or []) if isinstance(h, dict)],
-            [parse_trade(t) for t in (trades_raw or []) if isinstance(t, dict)],
+            info if isinstance(info, dict) else {},
+            [parse_holder(h) for h in rows_from_payload(holders_raw)],
+            [parse_trade(t) for t in rows_from_payload(trades_raw)],
         )
 
-    async def analyze(self, token: Token) -> TokenMetrics:
-        """Полный проход: сходить в сеть и посчитать метрики."""
+    async def gather(
+        self, token: Token,
+    ) -> tuple[dict[str, Any], list[Holder], list[Trade], CurveState | None]:
+        """Сеть плюс фолбэк кривой с полей токена, если карточка REST пустая."""
         info, holders, trades = await self.fetch(token.mint)
         enrich_token(token, info)
-        curve = state_from_any(info, token.market_cap_sol)
-        return compute_metrics(
+        curve = state_from_any(
+            info, token.market_cap_sol, sol_in_curve=token.sol_in_curve,
+        )
+        return info, holders, trades, curve
+
+    async def inspect(
+        self, token: Token,
+    ) -> tuple[list[Holder], list[Trade], CurveState | None, TokenMetrics]:
+        """То, что пайплайну нужно до агентов: сырьё, кривая, метрики."""
+        _info, holders, trades, curve = await self.gather(token)
+        metrics = compute_metrics(
             token, holders, trades, curve, self.config.market,
             planned_sol=self.config.risk.max_sol_per_trade,
         )
+        return holders, trades, curve, self.adopt_ws_buyers(token, metrics)
 
-    def passes(self, metrics: TokenMetrics) -> tuple[bool, str]:
+    async def analyze(self, token: Token) -> TokenMetrics:
+        """Полный проход: сходить в сеть и посчитать метрики."""
+        _holders, _trades, _curve, metrics = await self.inspect(token)
+        return metrics
+
+    def adopt_ws_buyers(self, token: Token, metrics: TokenMetrics) -> TokenMetrics:
+        """Пустой REST-tape не обнуляет покупателей, которых уже посчитал монитор."""
+        needed = self.config.filter.min_unique_buyers
+        if metrics.trade_count == 0 and token.unique_buyers >= needed:
+            metrics.trade_count = token.unique_buyers
+            metrics.unique_wallets = max(metrics.unique_wallets, token.unique_buyers)
+        return metrics
+
+    def passes(self, metrics: TokenMetrics, token: Token | None = None) -> tuple[bool, str]:
         """Отсечка по риск-скору и торгуемости. Возвращает (прошёл, причина)."""
         market = self.config.market
-        if metrics.trade_count == 0:
+        buyers = token.unique_buyers if token is not None else 0
+        if metrics.trade_count == 0 and buyers < self.config.filter.min_unique_buyers:
             return False, "no_trade_data"
-        if metrics.curve_liquidity_sol < market.min_curve_liquidity_sol:
+        liquidity = metrics.curve_liquidity_sol
+        if liquidity < market.min_curve_liquidity_sol and token is not None:
+            liquidity = max(liquidity, real_sol_from_hint(token.sol_in_curve))
+        if liquidity < market.min_curve_liquidity_sol:
             # Из тонкой кривой не выйти: своя же продажа обвалит цену.
             return False, "curve_too_thin"
         if (metrics.round_trip_cost_pct

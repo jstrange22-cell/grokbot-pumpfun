@@ -256,8 +256,40 @@ def round_trip_cost_pct(
     return (1.0 - sell.sol_out / sol_in) * 100.0
 
 
-def state_from_any(data: dict[str, Any], market_cap_sol: float = 0.0) -> CurveState | None:
-    """Состояние кривой из чего угодно: резервов, капитализации, цены."""
+def real_sol_from_hint(sol_in_curve: float) -> float:
+    """Сколько реальных SOL в кривой по полю с сокета или REST.
+
+    `vSolInBondingCurve` и `virtual_sol_reserves` включают 30 виртуальных
+    SOL. Маленькое число — уже реальная ликвидность: иначе порог
+    `min_curve_liquidity_sol` (3) никогда не выполнится из `sol_in_curve=5`.
+    """
+    if sol_in_curve <= 0:
+        return 0.0
+    if sol_in_curve > INITIAL_VIRTUAL_SOL:
+        return sol_in_curve - INITIAL_VIRTUAL_SOL
+    return sol_in_curve
+
+
+def state_from_sol_in_curve(
+    sol_in_curve: float, *, complete: bool = False,
+) -> CurveState | None:
+    """Кривая из одного объёма SOL: виртуальный (обычно) или реальный."""
+    if sol_in_curve <= 0:
+        return None
+    sol = sol_in_curve if sol_in_curve > INITIAL_VIRTUAL_SOL else (
+        INITIAL_VIRTUAL_SOL + sol_in_curve
+    )
+    k = INITIAL_VIRTUAL_SOL * INITIAL_VIRTUAL_TOKENS
+    state = CurveState(sol_reserves=sol, token_reserves=k / sol, complete=complete)
+    return state if state.is_valid else None
+
+
+def state_from_any(
+    data: dict[str, Any],
+    market_cap_sol: float = 0.0,
+    sol_in_curve: float = 0.0,
+) -> CurveState | None:
+    """Состояние кривой из чего угодно: резервов, капитализации, цены, SOL."""
     state = CurveState.from_api(data)
     if state is not None:
         return state
@@ -267,7 +299,11 @@ def state_from_any(data: dict[str, Any], market_cap_sol: float = 0.0) -> CurveSt
     restored = CurveState.from_spot_price(spot)
     if restored is not None:
         restored.complete = bool(data.get("complete") or data.get("raydium_pool"))
-    return restored
+        return restored
+    return state_from_sol_in_curve(
+        sol_in_curve,
+        complete=bool(data.get("complete") or data.get("raydium_pool")),
+    )
 
 
 def price_from_reserves(data: dict[str, Any]) -> float:

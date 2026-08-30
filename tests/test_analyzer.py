@@ -89,6 +89,95 @@ async def test_analyze_rejects_token_without_trades(config):
     assert not ok and reason == "no_trade_data"
 
 
+async def test_empty_rest_trades_pass_when_ws_buyers_sufficient(config):
+    """v3 /trades и /holders — 404 без JWT. Монитор уже набрал 5 покупателей."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/trades/" in request.url.path or request.url.path.endswith("/holders"):
+            return httpx.Response(404, json={"error": "no jwt"})
+        return httpx.Response(200, json={})
+
+    analyzer = Analyzer(config, client(handler))
+    tok = token(unique_buyers=5, sol_in_curve=35.0, market_cap_sol=40.0)
+    metrics = await analyzer.analyze(tok)
+    ok, reason = analyzer.passes(metrics, tok)
+    assert ok, reason
+    assert metrics.trade_count >= 5
+    assert metrics.curve_liquidity_sol >= config.market.min_curve_liquidity_sol
+
+
+async def test_empty_rest_trades_without_buyers_still_no_trade_data(config):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/trades/" in request.url.path or request.url.path.endswith("/holders"):
+            return httpx.Response(404)
+        return httpx.Response(200, json={})
+
+    analyzer = Analyzer(config, client(handler))
+    tok = token(unique_buyers=0, sol_in_curve=35.0)
+    metrics = await analyzer.analyze(tok)
+    ok, reason = analyzer.passes(metrics, tok)
+    assert not ok and reason == "no_trade_data"
+
+
+async def test_empty_rest_coin_uses_token_sol_in_curve(config):
+    """Пустая карточка не делает curve_too_thin, если сокет уже видел SOL."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/trades/" in request.url.path:
+            return httpx.Response(200, json=[
+                {"user": "w1", "txType": "buy", "solAmount": 0.4},
+            ])
+        if request.url.path.endswith("/holders"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json={})
+
+    analyzer = Analyzer(config, client(handler))
+    tok = token(unique_buyers=0, sol_in_curve=35.0, market_cap_sol=0.0)
+    metrics = await analyzer.analyze(tok)
+    ok, reason = analyzer.passes(metrics, tok)
+    assert reason != "curve_too_thin"
+    assert metrics.curve_liquidity_sol >= config.market.min_curve_liquidity_sol
+    assert ok or reason != "curve_too_thin"
+
+
+async def test_fetch_falls_back_to_v3_when_primary_is_530(config):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "frontend-api.pump.fun":
+            return httpx.Response(530, text="error code: 1016")
+        if request.url.host == "frontend-api-v3.pump.fun":
+            if "/trades/" in request.url.path or request.url.path.endswith("/holders"):
+                return httpx.Response(404)
+            return httpx.Response(200, json={
+                "virtual_sol_reserves": 45_000_000_000,
+                "virtual_token_reserves": 715_333_460_666_667,
+                "market_cap": 40.0,
+                "complete": False,
+            })
+        return httpx.Response(500)
+
+    config.data.rest_url = "https://frontend-api.pump.fun"
+    analyzer = Analyzer(
+        config, httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    info, holders, trades = await analyzer.fetch("Mint1")
+    assert info["virtual_sol_reserves"] == 45_000_000_000
+    assert holders == []
+    assert trades == []
+
+
+async def test_analyzer_does_not_send_data_api_key_as_jwt(config):
+    seen_auth: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers.get("authorization", ""))
+        return httpx.Response(200, json={"description": "x"})
+
+    analyzer = Analyzer(config, client(handler))
+    await analyzer.fetch("Mint1")
+    assert seen_auth
+    assert all(value == "" for value in seen_auth)
+
+
 def test_client_outside_context_is_an_error(config):
     with pytest.raises(RuntimeError):
         _ = Analyzer(config).client

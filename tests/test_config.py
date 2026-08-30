@@ -111,6 +111,10 @@ def test_good_config_passes():
     assert isinstance(config().check_ready(), list)
 
 
+def test_default_rest_url_is_frontend_v3():
+    assert Config().data.rest_url == "https://frontend-api-v3.pump.fun"
+
+
 @pytest.mark.parametrize(
     "section,patch,marker",
     [

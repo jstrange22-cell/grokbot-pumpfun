@@ -239,6 +239,39 @@ A later paper buy looks like:
 stay `dry-run`. `curve_too_full` skips are expected for bonding-curve
 graduates — those are not the bug.
 
+### Analyzer skips every promote as `no_trade_data` (0.4.3)
+
+Promotes are landing (monitor `unique_buyers` 5+) but analyzer writes
+`stage=analyzer reason=no_trade_data` and `grok_tokens_in` stays 0.
+`frontend-api.pump.fun` is dead (HTTP 530 / Cloudflare 1016).
+`frontend-api-v3.pump.fun /coins/{mint}` is the public card; `/trades` and
+`/holders` 404 without a site JWT. PumpPortal `data.api_key` is not that
+JWT. After 0.4.3 default `data.rest_url` is v3; empty REST trades do not
+veto when the monitor already met `min_unique_buyers`; empty REST coin
+uses `token.sol_in_curve` / `market_cap_sol`; live buy can quote the
+on-chain bonding curve if the card is thin.
+
+**How to tell the fix worked** (after a crewvet rebuild, not Hostinger
+Update):
+
+```bash
+# analyzer veto should drop; Grok should start spending
+docker exec grokbot-pumpfun python - <<'PY'
+import json
+from collections import Counter
+rows = [json.loads(l) for l in open("/app/logs/trades.jsonl") if l.strip()]
+print("promotes", sum(1 for r in rows if r.get("type")=="promote"))
+print("analyzer", Counter(r.get("reason") for r in rows if r.get("stage")=="analyzer"))
+print("intent/buy", Counter(r.get("type") for r in rows if r.get("type") in ("intent","buy")))
+PY
+curl -s localhost:18080/healthz | jq '{status,pending_launches,grok_tokens_in,trades_today}'
+```
+
+Expect: `analyzer.no_trade_data` stops climbing on new promotes;
+`grok_tokens_in` moves; then `intent` and `buy` (dry-run `tx_hash=dry_run`,
+or a live signature after a human promote). A leftover
+`no_trade_data` tail from 0.4.2 is history — watch only new lines.
+
 ```bash
 # on the VPS, after a crewvet image rebuild (do NOT Hostinger Update/Start)
 docker exec grokbot-pumpfun grep -E '"type": "promote"|"type": "buy"' /app/logs/trades.jsonl | tail

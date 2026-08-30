@@ -63,6 +63,8 @@ CONFIRM_WAIT_SECONDS = 0.4
 
 # Смещение полей в аккаунтах программы. Короче — отказываемся читать.
 _GLOBAL_FEE_RECIPIENT = 41
+_CURVE_VIRTUAL_TOKEN = 8
+_CURVE_VIRTUAL_SOL = 16
 _CURVE_COMPLETE = 48
 _CURVE_CREATOR = 49
 _CURVE_MAYHEM = 81
@@ -124,6 +126,8 @@ class BondingCurveOnchain:
     complete: bool
     mayhem: bool
     quote_mint: Pubkey
+    virtual_token_reserves: int = 0
+    virtual_sol_reserves: int = 0
 
 
 @dataclass(frozen=True)
@@ -259,8 +263,14 @@ def parse_bonding_curve(data: bytes) -> BondingCurveOnchain:
         quote = Pubkey.default()
     if quote not in (Pubkey.default(), WSOL_MINT):
         raise LiveClosed("кривая не в SOL — этот исполнитель такие не берёт")
+    virtual_token = 0
+    virtual_sol = 0
+    if len(data) >= _CURVE_VIRTUAL_SOL + 8:
+        virtual_token = struct.unpack_from("<Q", data, _CURVE_VIRTUAL_TOKEN)[0]
+        virtual_sol = struct.unpack_from("<Q", data, _CURVE_VIRTUAL_SOL)[0]
     return BondingCurveOnchain(
-        creator=creator, complete=complete, mayhem=mayhem, quote_mint=quote
+        creator=creator, complete=complete, mayhem=mayhem, quote_mint=quote,
+        virtual_token_reserves=virtual_token, virtual_sol_reserves=virtual_sol,
     )
 
 
