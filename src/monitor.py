@@ -175,7 +175,7 @@ class LaunchMonitor:
             return token
         info = await fetch_offchain_metadata(
             token.metadata_uri,
-            timeout=self.config.data.request_timeout,
+            request_timeout=self.config.data.request_timeout,
         )
         return apply_offchain_metadata(token, info)
 

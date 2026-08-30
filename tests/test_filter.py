@@ -398,7 +398,7 @@ async def test_stream_does_not_fetch_when_name_is_present(monkeypatch):
     created = (time.time() - 300) * 1000
     called: list[str] = []
 
-    async def fake_fetch(uri: str, timeout: float = 10.0, client=None):
+    async def fake_fetch(uri: str, request_timeout: float = 10.0, client=None):
         called.append(uri)
         return {}
 
@@ -429,7 +429,7 @@ async def test_stream_enriches_nameless_create_from_uri(monkeypatch):
     created = (time.time() - 300) * 1000
     seen_uris: list[str] = []
 
-    async def fake_fetch(uri: str, timeout: float = 10.0, client=None):
+    async def fake_fetch(uri: str, request_timeout: float = 10.0, client=None):
         seen_uris.append(uri)
         return {"name": "From URI", "symbol": "URI", "image": "https://img/from-uri.png"}
 
@@ -461,7 +461,7 @@ async def test_nameless_create_stays_no_metadata_if_uri_fetch_fails(monkeypatch)
     """Нет имени и JSON по uri не открылся — отказ, а не пропуск фильтра."""
     created = (time.time() - 300) * 1000
 
-    async def fake_fetch(uri: str, timeout: float = 10.0, client=None):
+    async def fake_fetch(uri: str, request_timeout: float = 10.0, client=None):
         return {}
 
     import src.monitor as monitor_module

@@ -126,7 +126,7 @@ def test_resolve_ipfs_uri():
 
 
 def test_apply_offchain_metadata_fills_name_and_image():
-    tok = token(name=None, image_uri=None)
+    tok = token(name=None, symbol=None, image_uri=None)
     apply_offchain_metadata(tok, {
         "name": "From URI",
         "symbol": "URI",

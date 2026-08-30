@@ -179,13 +179,13 @@ def apply_offchain_metadata(token: Token, info: dict[str, Any]) -> Token:
 
 async def fetch_offchain_metadata(
     uri: str,
-    timeout: float = 10.0,
+    request_timeout: float = 10.0,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """Скачать JSON по `uri`. Без API-ключа: это публичный файл, не data API."""
     url = resolve_metadata_url(uri)
     owns_client = client is None
-    http = client or httpx.AsyncClient(timeout=timeout)
+    http = client or httpx.AsyncClient(timeout=request_timeout)
     try:
         resp = await http.get(url)
         resp.raise_for_status()
