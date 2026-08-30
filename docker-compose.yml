@@ -1,6 +1,8 @@
 # ATLAS dry-run on Hostinger Docker Manager (TradeWorks VPS).
 # Health is on host 18080 because 8080 is already taken on this box.
-# Stop new buys: touch state/KILL   Resume: rm state/KILL
+# Grok key lives in /opt/grokbot/secrets.env on the VPS so Hostinger
+# Compose-from-URL cannot overwrite it with .env.example dummies.
+# Stop new buys: touch /opt/grokbot/KILL   Resume: rm that file
 # Promote to live is a human step, not a compose default.
 
 services:
@@ -11,19 +13,19 @@ services:
     restart: unless-stopped
     stop_grace_period: 45s
     command: ["run", "--config", "/app/config.atlas.yaml"]
+    env_file:
+      - /opt/grokbot/secrets.env
     environment:
-      GROKBOT_MODE: "${GROKBOT_MODE:-dry-run}"
-      GROKBOT_GROK_API_KEY: "${GROKBOT_GROK_API_KEY:-}"
-      GROKBOT_DATA_API_KEY: "${GROKBOT_DATA_API_KEY:-}"
-      GROKBOT_WALLET_PRIVATE_KEY: "${GROKBOT_WALLET_PRIVATE_KEY:-}"
-      GROKBOT_LOG_LEVEL: "${GROKBOT_LOG_LEVEL:-INFO}"
+      GROKBOT_MODE: "dry-run"
+      GROKBOT_LOG_LEVEL: "INFO"
       GROKBOT_HEALTH_PORT: "8080"
-      GROKBOT_KILL_FILE: "${GROKBOT_KILL_FILE:-/app/state/KILL}"
+      GROKBOT_KILL_FILE: "/app/state/KILL"
     ports:
       - "127.0.0.1:18080:8080"
     volumes:
       - grokbot_logs:/app/logs
       - grokbot_state:/app/state
+      - /opt/grokbot/secrets.env:/opt/grokbot/secrets.env:ro
     logging:
       driver: json-file
       options:
