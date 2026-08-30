@@ -1,7 +1,10 @@
-# Запуск:
-#   cp .env.example .env && $EDITOR .env       # ключи живут здесь
-#   mkdir -p config && cp config.example.yaml config/config.yaml
+# ATLAS dry-run:
+#   cp .env.example .env && $EDITOR .env
+#   mkdir -p config logs state && cp config.atlas.yaml config/config.yaml
 #   docker compose up -d && docker compose logs -f
+# Stop new buys without restart:  touch state/KILL
+# Resume buys:                   rm state/KILL
+# Promote to live is a human step, not a compose default.
 
 services:
   grokbot:
@@ -17,6 +20,7 @@ services:
       GROKBOT_WALLET_PRIVATE_KEY: "${GROKBOT_WALLET_PRIVATE_KEY:-}"
       GROKBOT_LOG_LEVEL: "${GROKBOT_LOG_LEVEL:-INFO}"
       GROKBOT_HEALTH_PORT: "8080"
+      GROKBOT_KILL_FILE: "${GROKBOT_KILL_FILE:-/app/state/KILL}"
     ports:
       - "127.0.0.1:8080:8080"     # наружу health не выставляем
     volumes:

@@ -17,6 +17,7 @@ from src.doctor import (
     check_curve_constants,
     check_data_api,
     check_grok,
+    check_kill_switch,
     check_live_readiness,
     check_paths,
     check_rpc,
@@ -213,16 +214,32 @@ def test_dry_run_mode_is_ok(config):
     assert check_live_readiness(config)[0].status == OK
 
 
-def test_live_mode_flags_the_stub(config):
-    """Пока исполнение — заглушка, live не должен считаться готовым."""
+def test_live_mode_warns_and_requires_a_wallet(config):
+    """Live больше не заглушка, но без ключа кошелька doctor всё равно откажет."""
     config.mode = "live"
     checks = check_live_readiness(config)
     assert checks[0].status == WARN
-    assert any(c.status == FAIL and "заглушка" in c.detail for c in checks)
+    assert any(c.status == FAIL and "кошелька" in c.detail for c in checks)
+    config.solana.wallet_private_key = "5xРеальныйКлючДляДоктора"
+    ready = check_live_readiness(config)
+    assert ready[0].status == WARN
+    assert all(c.status != FAIL for c in ready)
 
 
 def test_curve_constants_look_sane():
     assert check_curve_constants().status == OK
+
+
+def test_kill_switch_check_warns_when_file_exists(tmp_path, monkeypatch):
+    from src.kill import ENV_KILL_FILE
+
+    path = tmp_path / "KILL"
+    monkeypatch.setenv(ENV_KILL_FILE, str(path))
+    assert check_kill_switch().status == OK
+    path.write_text("stop")
+    check = check_kill_switch()
+    assert check.status == WARN
+    assert "KILL" in check.detail
 
 
 # --- отчёт ----------------------------------------------------------------

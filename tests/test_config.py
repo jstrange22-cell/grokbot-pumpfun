@@ -170,3 +170,18 @@ def test_dry_run_ignores_wallet_key():
     """В dry-run кошелёк не нужен: ключ не требуется вообще."""
     errors, _ = config().problems()
     assert not any("wallet" in e for e in errors)
+
+
+def test_default_mode_is_dry_run():
+    assert Config().mode == "dry-run"
+    assert not Config().is_live
+
+
+def test_atlas_template_stays_dry_run_and_rejects_placeholders():
+    cfg = Config.load("config.atlas.yaml", env={})
+    assert cfg.mode == "dry-run"
+    assert cfg.risk.max_open_positions == 1
+    errors, _ = cfg.problems()
+    assert any("grok.api_key" in e for e in errors)
+    with pytest.raises(ConfigError):
+        cfg.check_ready()

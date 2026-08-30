@@ -5,7 +5,7 @@
 # Секреты можно не класть в файл вообще — переменные окружения важнее его:
 #   GROKBOT_GROK_API_KEY, GROKBOT_DATA_API_KEY, GROKBOT_WALLET_PRIVATE_KEY,
 #   GROKBOT_MODE, GROKBOT_RPC_URL, GROKBOT_LOG_PATH, GROKBOT_LOG_LEVEL,
-#   GROKBOT_STATE_PATH, GROKBOT_HEALTH_PORT
+#   GROKBOT_STATE_PATH, GROKBOT_HEALTH_PORT, GROKBOT_KILL_FILE
 # Так и сделано в Dockerfile: образ не содержит ни одного ключа.
 #
 # Конфиг проверяется на старте. Бессмысленные значения (нулевой лимит,

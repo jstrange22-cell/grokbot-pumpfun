@@ -19,7 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src ./src
 COPY scripts ./scripts
-COPY config.example.yaml pyproject.toml README.md ./
+COPY config.example.yaml config.atlas.yaml pyproject.toml README.md ./
 
 # Логи и состояние — тома: они должны переживать пересборку образа.
 RUN mkdir -p /app/logs /app/state /app/config && chown -R grokbot:grokbot /app

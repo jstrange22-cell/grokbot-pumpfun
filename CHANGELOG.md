@@ -3,6 +3,20 @@
 Формат: что изменилось и почему это имело значение. Версии — по смыслу, а
 не по расписанию.
 
+## 0.4.0 — 2026-08-30
+
+ATLAS desk: dry-run remains the only default; live buy/sell sits behind
+the existing gate.
+
+- `LiveExecutor.buy` / `.sell` send a single-wallet pump.fun bonding-curve
+  trade (solders Keypair, curve accounts, ATA, ComputeBudget, optional
+  Jito bundle, confirmation). Fail closed on missing key, RPC error, or
+  no confirmation. Tests mock RPC/Jito and never hit the network.
+- Kill switch: file `KILL` or `$GROKBOT_KILL_FILE` blocks new buys;
+  exits on open positions still run.
+- `config.atlas.yaml` — committed ATLAS dry-run caps (placeholders only).
+- English ATLAS ops in README/RUNBOOK. Promote is a human step.
+
 ## 0.3.0 — 2026-08-27
 
 Версия про то, чтобы цифры в отчётах соответствовали тому, что произошло бы

@@ -1,0 +1,103 @@
+# ATLAS desk defaults. Safe to commit: placeholders only, no live keys.
+# Copy to config.yaml (gitignored) or mount as config/config.yaml in Docker,
+# then put real secrets in the environment — never in this file.
+#
+#   cp config.atlas.yaml config.yaml
+#   export GROKBOT_GROK_API_KEY=xai-...
+#   grokbot doctor --config config.atlas.yaml   # will fail until the key is real
+#   grokbot run --config config.yaml
+#
+# mode stays dry-run. Promote to live is a human step (write "promote",
+# dedicated hot wallet, --i-understand-the-risk). Do not flip it here.
+#
+# Env that override this file:
+#   GROKBOT_GROK_API_KEY, GROKBOT_DATA_API_KEY, GROKBOT_WALLET_PRIVATE_KEY,
+#   GROKBOT_MODE, GROKBOT_RPC_URL, GROKBOT_LOG_PATH, GROKBOT_LOG_LEVEL,
+#   GROKBOT_STATE_PATH, GROKBOT_HEALTH_PORT, GROKBOT_ALERT_WEBHOOK,
+#   GROKBOT_KILL_FILE (default ./KILL — presence blocks new buys only)
+
+mode: dry-run
+
+grok:
+  api_key: "xai-YOUR-KEY-HERE"
+  base_url: "https://api.x.ai/v1/chat/completions"
+  fast_model: "grok-4-fast"
+  checker_model: "grok-4"
+  timeout_seconds: 30
+  max_retries: 3
+  retry_base_delay: 1.0
+
+solana:
+  rpc_url: "https://api.mainnet-beta.solana.com"
+  wallet_private_key: "YOUR-BASE58-PRIVATE-KEY"
+  jito:
+    enabled: true
+    block_engine_url: "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+    tip_lamports: 1000000
+
+data:
+  api_key: "YOUR-DATA-PROVIDER-KEY"
+  rest_url: "https://frontend-api.pump.fun"
+  ws_url: "wss://pumpportal.fun/api/data"
+  request_timeout: 10
+
+# One FOMO crypto seat. Separate book from Kraken atlas-p1.
+# These caps are capital-preservation defaults, not a suggestion to size up.
+risk:
+  max_sol_per_trade: 0.05
+  daily_loss_limit_sol: 0.1
+  max_trades_per_day: 10
+  max_open_positions: 1
+  max_total_exposure_sol: 0.05
+  cooldown_after_losses: 3
+  cooldown_minutes: 30
+  stop_loss_pct: 30.0
+  stop_loss_poll_seconds: 15
+  take_profit_pct: 120.0
+  trailing_stop_pct: 35.0
+  max_hold_seconds: 3600
+
+filter:
+  min_unique_buyers: 5
+  max_curve_progress: 0.40
+  require_metadata: true
+  min_age_seconds: 120
+  max_risk_score: 7.0
+  min_total_score: 0.65
+  block_creator_after_rugs: 1
+  rug_loss_pct: 60.0
+  one_position_per_creator: true
+  forget_creators_after_days: 30
+
+scoring:
+  weights:
+    audit: 0.30
+    narrative: 0.25
+    timing: 0.15
+    metrics: 0.30
+  timing_cache_seconds: 900
+
+logging:
+  path: "logs/trades.jsonl"
+  level: "INFO"
+  max_bytes: 50000000
+  backups: 5
+
+alerts:
+  webhook_url: ""
+  events: ["started", "buy", "close", "rug", "breaker", "halted", "blind", "killed"]
+  timeout_seconds: 10
+  max_per_minute: 20
+
+ops:
+  state_path: "state/pipeline.json"
+  reputation_path: "state/creators.json"
+  health_port: 8080
+  health_host: "127.0.0.1"
+  heartbeat_seconds: 300
+  shutdown_grace_seconds: 30
+  max_grok_calls_per_day: 2000
+  grok_max_concurrency: 4
+  grok_calls_per_minute: 60
+  breaker_failures: 8
+  breaker_cooldown_seconds: 120

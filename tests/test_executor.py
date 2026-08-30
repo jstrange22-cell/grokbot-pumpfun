@@ -174,12 +174,13 @@ def test_build_executor_picks_by_mode():
     assert isinstance(build_executor(live), LiveExecutor)
 
 
-async def test_live_executor_is_a_deliberate_stub():
+async def test_live_executor_fails_closed_without_a_key():
+    """Нет ключа — отказ, не NotImplementedError и не поход в сеть."""
     executor = LiveExecutor(config(), client(LIVE_CURVE))
-    with pytest.raises(NotImplementedError, match="намеренно"):
-        await executor.buy(token(), 0.4)
-    with pytest.raises(NotImplementedError, match="намеренно"):
-        await executor.sell(position())
+    bought = await executor.buy(token(), 0.4)
+    sold = await executor.sell(position())
+    assert not bought.ok and "ключа" in bought.error
+    assert not sold.ok and "ключа" in sold.error
 
 
 async def test_live_executor_can_still_quote():
@@ -201,3 +202,285 @@ def test_new_position_carries_context():
     assert pos.peak_price == pos.entry_price == 1e-7
     assert pos.score == 0.81
     assert pos.realized_sol == 0.0 and pos.partials == 0
+
+
+# --- live: мок RPC, в сеть не ходим ---------------------------------------
+
+
+def _live_wallet():
+    from solders.keypair import Keypair
+    from solders.signature import Signature
+
+    kp = Keypair()
+    return kp, str(Signature.from_bytes(bytes(kp)))
+
+
+def _rpc_client(handler):
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def _pack_curve(creator, complete=False):
+
+    data = bytearray(120)
+    data[48] = 1 if complete else 0
+    data[49:81] = bytes(creator)
+    return bytes(data)
+
+
+def _pack_global(fee):
+    data = bytearray(520)
+    data[41:73] = bytes(fee)
+    return bytes(data)
+
+
+def _account_json(data: bytes, owner: str):
+    import base64
+
+    return {
+        "value": {
+            "data": [base64.b64encode(data).decode(), "base64"],
+            "owner": owner,
+            "lamports": 1,
+        }
+    }
+
+
+def _live_rpc(
+    *,
+    wallet,
+    mint,
+    creator,
+    fee,
+    confirm=True,
+    send_error=None,
+    missing=(),
+    rpc_down=False,
+    complete=False,
+    jito=False,
+):
+    import json
+
+    from src.onchain import TOKEN_PROGRAM, derive_accounts
+
+    acc = derive_accounts(mint, wallet.pubkey(), creator, fee, TOKEN_PROGRAM)
+    store = {
+        str(mint): _account_json(b"\x00" * 82, str(TOKEN_PROGRAM)),
+        str(acc.bonding_curve): _account_json(
+            _pack_curve(creator, complete), str(acc.bonding_curve),
+        ),
+        str(acc.global_account): _account_json(_pack_global(fee), str(acc.global_account)),
+    }
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if rpc_down:
+            raise httpx.ConnectError("сети нет")
+        body = json.loads(request.content)
+        method = body["method"]
+        seen.append(method)
+        if method == "getAccountInfo":
+            key = body["params"][0]
+            if key in missing or key not in store:
+                return httpx.Response(200, json={"result": {"value": None}})
+            return httpx.Response(200, json={"result": store[key]})
+        if method == "getLatestBlockhash":
+            return httpx.Response(200, json={
+                "result": {"value": {"blockhash": "11111111111111111111111111111111"}}
+            })
+        if method == "sendTransaction":
+            if send_error:
+                return httpx.Response(200, json={"error": send_error})
+            return httpx.Response(200, json={"result": "5" + "1" * 86})
+        if method == "sendBundle":
+            if send_error:
+                return httpx.Response(200, json={"error": send_error})
+            return httpx.Response(200, json={"result": "bundle-1"})
+        if method == "getSignatureStatuses":
+            if not confirm:
+                return httpx.Response(200, json={"result": {"value": [None]}})
+            return httpx.Response(200, json={
+                "result": {"value": [{"err": None, "confirmationStatus": "confirmed", "slot": 1}]}
+            })
+        return httpx.Response(200, json={"error": f"unexpected {method}"})
+
+    return handler, seen, acc
+
+
+def _live_config(secret: str, *, jito=False):
+    cfg = config()
+    cfg.mode = "live"
+    cfg.solana.wallet_private_key = secret
+    cfg.solana.jito.enabled = jito
+    cfg.solana.jito.tip_lamports = 1_000_000
+    return cfg
+
+
+def _live_exec(secret: str, handler, *, jito=False, rpc=None, curve=None):
+    payload = LIVE_CURVE if curve is None else curve
+    return LiveExecutor(
+        _live_config(secret, jito=jito),
+        client(payload),
+        rpc_client=None if rpc is not None else _rpc_client(handler),
+        rpc=rpc,
+    )
+
+
+async def test_live_buy_happy_path():
+    from solders.keypair import Keypair
+    from solders.pubkey import Pubkey
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    creator = Keypair().pubkey()
+    fee = Keypair().pubkey()
+    handler, seen, acc = _live_rpc(wallet=wallet, mint=mint.pubkey(), creator=creator, fee=fee)
+    tok = token(mint=str(mint.pubkey()))
+    executor = _live_exec(secret, handler)
+
+    result = await executor.buy(tok, 0.4)
+    assert result.ok, result.error
+    assert result.tx_hash
+    assert result.tx_hash != DRY_RUN_TX
+    assert result.token_amount > 0
+    assert result.sol_amount == pytest.approx(0.4)
+    assert "sendTransaction" in seen
+    assert "sendBundle" not in seen
+    assert "getSignatureStatuses" in seen
+    assert Pubkey.from_string(str(acc.mint)) == mint.pubkey()
+
+
+async def test_live_sell_happy_path_closes_ata_on_full_exit():
+    from solders.keypair import Keypair
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    creator = Keypair().pubkey()
+    fee = Keypair().pubkey()
+    handler, seen, _acc = _live_rpc(wallet=wallet, mint=mint.pubkey(), creator=creator, fee=fee)
+    pos = position()
+    pos.mint = str(mint.pubkey())
+    executor = _live_exec(secret, handler)
+
+    result = await executor.sell(pos)
+    assert result.ok, result.error
+    assert result.tx_hash
+    assert result.sol_amount > 0
+    assert "sendTransaction" in seen
+
+
+async def test_live_jito_bundle_subtracts_tip_from_cost():
+    from solders.keypair import Keypair
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    handler, seen, _ = _live_rpc(
+        wallet=wallet, mint=mint.pubkey(), creator=Keypair().pubkey(),
+        fee=Keypair().pubkey(), jito=True,
+    )
+    executor = _live_exec(secret, handler, jito=True)
+    result = await executor.buy(token(mint=str(mint.pubkey())), 0.4)
+    assert result.ok, result.error
+    assert "sendBundle" in seen
+    assert "sendTransaction" not in seen
+    assert result.sol_amount == pytest.approx(0.4 + 0.001)
+
+
+async def test_live_buy_fails_closed_on_rpc_error():
+    from solders.keypair import Keypair
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    handler, _seen, _ = _live_rpc(
+        wallet=wallet, mint=mint.pubkey(), creator=Keypair().pubkey(),
+        fee=Keypair().pubkey(), rpc_down=True,
+    )
+    executor = _live_exec(secret, handler)
+    result = await executor.buy(token(mint=str(mint.pubkey())), 0.4)
+    assert not result.ok
+    assert "недоступен" in result.error or "RPC" in result.error
+
+
+async def test_live_buy_fails_closed_without_confirmation():
+    from solders.keypair import Keypair
+
+    from src.onchain import SolanaRpc
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    handler, _seen, _ = _live_rpc(
+        wallet=wallet, mint=mint.pubkey(), creator=Keypair().pubkey(),
+        fee=Keypair().pubkey(), confirm=False,
+    )
+
+    async def _noop(_s):
+        return None
+
+    rpc = SolanaRpc(
+        "http://rpc.test", _rpc_client(handler),
+        confirm_tries=2, confirm_wait=0, sleeper=_noop,
+    )
+    executor = LiveExecutor(_live_config(secret), client(LIVE_CURVE), rpc=rpc)
+    result = await executor.buy(token(mint=str(mint.pubkey())), 0.4)
+    assert not result.ok
+    assert "подтверждения" in result.error
+
+
+async def test_live_buy_fails_without_curve_account():
+    from solders.keypair import Keypair
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    handler, _seen, _acc = _live_rpc(
+        wallet=wallet, mint=mint.pubkey(), creator=Keypair().pubkey(),
+        fee=Keypair().pubkey(), missing=(str(mint.pubkey()),),
+    )
+    executor = _live_exec(secret, handler)
+    result = await executor.buy(token(mint=str(mint.pubkey())), 0.4)
+    assert not result.ok
+
+
+async def test_live_sell_fails_when_curve_completed():
+    from solders.keypair import Keypair
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    handler, _seen, _ = _live_rpc(
+        wallet=wallet, mint=mint.pubkey(), creator=Keypair().pubkey(),
+        fee=Keypair().pubkey(),
+    )
+    # REST говорит, что кривая закрыта — live не продаёт по спотовой прикидке.
+    executor = LiveExecutor(
+        _live_config(secret),
+        client({**LIVE_CURVE, "complete": True}),
+        rpc_client=_rpc_client(handler),
+    )
+    pos = position()
+    pos.mint = str(mint.pubkey())
+    result = await executor.sell(pos)
+    assert not result.ok
+    assert "закрыта" in result.error
+
+
+async def test_live_buy_fails_on_send_error():
+    from solders.keypair import Keypair
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    handler, _seen, _ = _live_rpc(
+        wallet=wallet, mint=mint.pubkey(), creator=Keypair().pubkey(),
+        fee=Keypair().pubkey(), send_error={"message": "blockhash not found"},
+    )
+    executor = _live_exec(secret, handler)
+    result = await executor.buy(token(mint=str(mint.pubkey())), 0.4)
+    assert not result.ok
+    assert "blockhash" in result.error or "RPC" in result.error
+
+
+async def test_live_buy_refused_when_rpc_client_missing():
+    _wallet, secret = _live_wallet()
+    from solders.keypair import Keypair
+
+    executor = LiveExecutor(_live_config(secret), client(LIVE_CURVE))
+    result = await executor.buy(token(mint=str(Keypair().pubkey())), 0.4)
+    assert not result.ok
+    assert "RPC" in result.error

@@ -4,6 +4,59 @@
 означает каждая жалоба и как её чинить. Архитектура и смысл ступеней — в
 [README](README.md), здесь только эксплуатация.
 
+## ATLAS dry-run deploy (English)
+
+This desk runs paper until a human writes **promote**. Do not set
+`GROKBOT_MODE=live` in compose or in a committed file.
+
+### First start
+
+```bash
+cp .env.example .env
+# put GROKBOT_GROK_API_KEY in .env — nothing else is required for dry-run
+mkdir -p config logs state
+cp config.atlas.yaml config/config.yaml
+docker compose up -d
+docker compose logs -f
+curl -s localhost:8080/healthz | jq
+```
+
+Bare metal: `cp config.atlas.yaml config.yaml`, export `GROKBOT_*`, then
+`grokbot doctor` and `grokbot run`.
+
+ATLAS caps in `config.atlas.yaml`: one open position, 0.05 SOL per trade
+and total exposure, 0.1 SOL daily loss, 10 trades/day, health on
+`127.0.0.1:8080`. Separate book from Kraken atlas-p1. Dedicated hot
+wallet later — never a Phantom or SafePal seed.
+
+### Kill switch
+
+If the kill file exists, **new buys are refused**. Open positions still
+get stop-loss / take-profit / trailing / max-hold.
+
+| where | file | stop buys | resume |
+|---|---|---|---|
+| host | `$GROKBOT_KILL_FILE` or `./KILL` | `touch KILL` | `rm KILL` |
+| Docker | `/app/state/KILL` (compose default) | `touch state/KILL` | `rm state/KILL` |
+
+`/healthz` has `"killed": true` while the file is present. Doctor warns.
+This is the fast stop; SIGTERM is the clean process stop.
+
+### Promote (human step, not a default)
+
+Promote is writing the word and meaning it — not checking a box in yaml.
+
+1. Days of dry-run with `grokbot replay` you actually read.
+2. Dedicated hot wallet, only the cash you can lose. Not the desk seed.
+3. Real key via `GROKBOT_WALLET_PRIVATE_KEY`, never committed.
+4. `mode: live` only in the local `config.yaml` or env.
+5. Start with `--i-understand-the-risk`.
+6. `grokbot doctor` must pass (live without a key still fails).
+
+Live executor sends one wallet's bonding-curve buy/sell. No snipe-and-dump
+helpers, no extra wallets, no wash. Fail closed: no key, RPC error, or
+missing confirmation means no fill is recorded.
+
 ## Запуск
 
 ### Голая машина
@@ -227,11 +280,17 @@ xAI, нет ли 429. Цепь замкнётся сама после кулда
 работает, пока процесс не поднят снова. Поэтому долгий простой при
 открытых позициях — риск, а не пауза.
 
-### `executor_not_implemented` в логе
+### `execution_failed` в логе (live)
 
-Включён `mode: live`, но `LiveExecutor` — заглушка по замыслу. Токен прошёл
-все девять ступеней и не был куплен. Либо дописать исполнение, либо
-вернуться в `dry-run`.
+`LiveExecutor` отказался отправлять сделку: нет ключа, RPC/Jito не
+ответил, нет подтверждения, кривая уже на Raydium. Это отказ ступени, не
+покупка. Проверьте кошелёк, если в логе уже есть `intent`.
+
+### `kill_switch` в логе
+
+Лежит файл `KILL` (или `$GROKBOT_KILL_FILE`). Новые покупки закрыты,
+открытые позиции продолжают вестись. Уберите файл, когда снова можно
+покупать.
 
 ### Конфиг не принят на старте
 
@@ -262,9 +321,10 @@ systemctl restart grokbot # или docker compose up -d --build
 ## Чек-лист перед переходом в live
 
 - [ ] сутки в `dry-run` отработаны, `replay` разобран
-- [ ] `LiveExecutor.buy` и `.sell` дописаны и протестированы отдельно
-- [ ] кошелёк отдельный, на нём только та сумма, которую не жалко
-- [ ] `risk.*` перепроверены на живых числах, а не на дефолтах
+- [ ] human wrote "promote" — not a config default
+- [ ] dedicated hot wallet, never Phantom/SafePal seed
+- [ ] `risk.*` are the ATLAS caps (or tighter), not the upstream example
 - [ ] `state/` на диске, который переживёт перезапуск машины
 - [ ] `/healthz` заведён в мониторинг, алерт на 503 настроен
+- [ ] kill file path is known (`touch` / `rm`) and tested in dry-run
 - [ ] `--i-understand-the-risk` добавлен в unit-файл осознанно

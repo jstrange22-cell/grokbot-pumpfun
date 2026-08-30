@@ -26,7 +26,8 @@ import httpx
 import websockets
 
 from .curve import sanity_check
-from .models import Config, mask
+from .kill import is_killed, kill_file_path
+from .models import Config, is_placeholder, mask
 from .state import InstanceLock
 
 log = logging.getLogger(__name__)
@@ -244,21 +245,25 @@ async def check_rpc(config: Config, client: httpx.AsyncClient | None = None) -> 
 def check_live_readiness(config: Config) -> list[Check]:
     if not config.is_live:
         return [Check("режим", OK, "dry-run: транзакции не отправляются")]
-    from .executor import LiveExecutor
-
     checks = [Check("режим", WARN, "live: транзакции будут отправлены по-настоящему")]
-    stub = "не реализован намеренно" in (LiveExecutor.buy.__doc__ or "")
-    try:
-        source = LiveExecutor.buy.__code__.co_consts
-        stub = stub or any("не реализован намеренно" in c for c in source if isinstance(c, str))
-    except AttributeError:      # pragma: no cover
-        pass
-    if stub:
+    if is_placeholder(config.solana.wallet_key):
         checks.append(Check(
-            "исполнение", FAIL, "LiveExecutor всё ещё заглушка",
-            "допишите отправку транзакций либо верните mode: dry-run",
+            "кошелёк", FAIL, "mode: live без ключа кошелька",
+            "задайте GROKBOT_WALLET_PRIVATE_KEY или верните mode: dry-run",
         ))
+    else:
+        checks.append(Check("кошелёк", OK, mask(config.solana.wallet_key)))
     return checks
+
+
+def check_kill_switch() -> Check:
+    path = kill_file_path()
+    if is_killed():
+        return Check(
+            "kill-switch", WARN, f"файл {path} есть — новые покупки закрыты",
+            "уберите файл, когда снова можно покупать; выходы из позиций продолжают работать",
+        )
+    return Check("kill-switch", OK, f"файла {path} нет")
 
 
 def check_curve_constants() -> Check:
@@ -285,6 +290,7 @@ async def run_checks(config: Config, skip_network: bool = False) -> Report:
     report.add(*check_config(config))
     report.add(*check_paths(config))
     report.add(check_curve_constants())
+    report.add(check_kill_switch())
     report.add(*check_live_readiness(config))
 
     if skip_network:
