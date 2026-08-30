@@ -28,6 +28,7 @@ import websockets
 from .curve import sanity_check
 from .kill import is_killed, kill_file_path
 from .models import Config, is_placeholder, mask
+from .monitor import data_socket_url
 from .state import InstanceLock
 
 log = logging.getLogger(__name__)
@@ -196,7 +197,7 @@ async def check_data_api(config: Config, client: httpx.AsyncClient | None = None
 async def check_socket(config: Config, wait_seconds: float = 15.0) -> Check:
     """Открывается ли поток лончей и идут ли по нему события."""
     try:
-        async with websockets.connect(config.data.ws_url, open_timeout=wait_seconds) as ws:
+        async with websockets.connect(data_socket_url(config), open_timeout=wait_seconds) as ws:
             await ws.send(json.dumps({"method": "subscribeNewToken"}))
             started = time.monotonic()
             while True:

@@ -40,7 +40,7 @@ from .kill import is_killed, kill_file_path
 from .log import TradeLog, read_log, setup_logging
 from .market import MarketPulse
 from .models import Analysis, Config, ConfigError, Position, Token
-from .monitor import LaunchMonitor
+from .monitor import LaunchMonitor, monitor_detail
 from .ops import (
     GrokOps,
     HealthServer,
@@ -242,6 +242,7 @@ class Pipeline:
         """Читать поток монитора и раздавать токены в обработку."""
         async for token in self.monitor.stream():
             self._last_event_at = time.time()
+            self._log_monitor_promote(token)
             self.metrics.inc("tokens_seen")
             self.pulse.record_launch(token.sol_in_curve)
             self._check_transitions()
@@ -495,7 +496,8 @@ class Pipeline:
 
     def status(self) -> dict[str, Any]:
         """Снимок для /healthz и heartbeat. Ничего секретного не содержит."""
-        stalled = (time.time() - self._last_event_at) > STALL_SECONDS
+        last_event = max(self._last_event_at, self.monitor.last_message_at)
+        stalled = (time.time() - last_event) > STALL_SECONDS
         breaker = self.grok_ops.breaker.state
         blind = bool(self.watcher.blind)
         state = "degraded" if breaker == "open" or stalled or blind else "ok"
@@ -504,7 +506,7 @@ class Pipeline:
             "mode": self.config.mode,
             "uptime_seconds": round(self.metrics.uptime_seconds, 1),
             "stalled": stalled,
-            "seconds_since_event": round(time.time() - self._last_event_at, 1),
+            "seconds_since_event": round(time.time() - last_event, 1),
             "in_flight": len(self._tasks),
             "pending_launches": len(self.monitor.pending),
             "open_positions": self.risk.open_count,
@@ -541,7 +543,16 @@ class Pipeline:
     def _log_monitor_skip(self, token: Token, reason: str) -> None:
         self.metrics.inc("skip_monitor")
         self.pulse.record_launch(token.sol_in_curve)
-        self.trade_log.skip(token, stage="monitor", reason=reason)
+        # Create/skip — тоже события сокета. Иначе /healthz висит
+        # degraded, пока хоть один лонч не дойдёт до Grok.
+        self._last_event_at = time.time()
+        self.trade_log.skip(
+            token, stage="monitor", reason=reason, detail=monitor_detail(token),
+        )
+
+    def _log_monitor_promote(self, token: Token) -> None:
+        self.metrics.inc("promote_monitor")
+        self.trade_log.promote(token, detail=monitor_detail(token))
 
     async def _price(self, mint: str) -> Tick:
         """Цена позиции плюс признак того, что токен уехал с кривой."""

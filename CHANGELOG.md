@@ -3,6 +3,25 @@
 Формат: что изменилось и почему это имело значение. Версии — по смыслу, а
 не по расписанию.
 
+## 0.4.2 — 2026-08-30
+
+- **Dry-run monitor never promoted.** After the metadata fix, ~10k
+  `stage=monitor` skips were still all terminal: `stale_no_traction` with
+  `few_buyers=0` / `too_young=0`. Buyer counts only came from per-mint
+  `subscribeTokenTrade`. PumpPortal replaces the key list on each call, so
+  one-mint subscribe left the rest of the buffer at `unique_buyers=0` until
+  the 900s TTL. The same method is also metered and wants `?api-key=`.
+  The monitor now resubscribes the **whole pending buffer** in one message,
+  attaches a real `data.api_key` to the socket URL (never a placeholder,
+  never logged), and REST-fills buyers from `data.rest_url` for age-ready
+  tokens when the trade tape is silent. Gates stay
+  `min_unique_buyers=5`, `min_age_seconds=120`, `max_curve_progress=0.40`,
+  `require_metadata=true`. Image is still not required.
+- Skip and promote JSONL lines now carry
+  `detail: "buyers=N age=Xs curve=0.abc"`. `/healthz` treats create/skip
+  as socket liveness, not only a promote — Docker HEALTHCHECK no longer
+  goes `unhealthy` while the tape is flowing.
+
 ## 0.4.1 — 2026-08-30
 
 - **PumpPortal create events were all skipped as `no_metadata`.**

@@ -52,13 +52,15 @@ def render(path: str, tail: int) -> str:
     today_buys = [r for r in todays if r.get("type") == "buy"]
     today_skips = [r for r in todays if r.get("type") == "skip"]
     today_closes = [r for r in todays if r.get("type") == "close"]
+    today_promotes = [r for r in todays if r.get("type") == "promote"]
     today_pnl = sum(r.get("pnl_sol", 0.0) for r in today_closes)
     total_pnl = sum(r.get("pnl_sol", 0.0) for r in closes)
     modes = Counter(r.get("mode", "?") for r in records[-50:])
     mode = modes.most_common(1)[0][0] if modes else "?"
 
     out.append(rule(f"grokbot-pumpfun · {mode}"))
-    out.append(f"сегодня ({today} UTC): куплено {len(today_buys)}   "
+    out.append(f"сегодня ({today} UTC): промоут {len(today_promotes)}   "
+               f"куплено {len(today_buys)}   "
                f"пропущено {len(today_skips)}   закрыто {len(today_closes)}")
     out.append(f"PnL сегодня: {today_pnl:+.4f} SOL      всего: {total_pnl:+.4f} SOL")
 

@@ -58,9 +58,12 @@ risk:
   max_hold_seconds: 3600
 
 filter:
+  # 5 buyers / 120s / curve < 40% stay. Do not loosen here.
+  # Buyer counts come from subscribeTokenTrade (whole pending buffer)
+  # plus REST fallback — not from create events.
   min_unique_buyers: 5
   max_curve_progress: 0.40
-  require_metadata: true
+  require_metadata: true   # name + (image or metadata uri); image not required
   min_age_seconds: 120
   max_risk_score: 7.0
   min_total_score: 0.65

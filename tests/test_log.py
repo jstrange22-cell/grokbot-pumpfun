@@ -1,6 +1,7 @@
 """JSONL-лог: ротация и чтение. Процесс живёт сутками, файл растёт всегда."""
 
 import json
+import time
 
 import pytest
 
@@ -114,6 +115,25 @@ def test_repeated_failures_do_not_spam_the_log(tmp_path, caplog):
             log.skip(token(), stage="monitor", reason="few_buyers")
     assert log.write_failures == 5
     assert caplog.text.count("не удалась") == 1     # только первая
+
+
+def test_promote_record_has_buyer_age_curve(tmp_path):
+    from src.log import TradeLog as TL
+    from src.models import Token as T
+
+    log = TL(tmp_path / "trades.jsonl")
+    token = T(
+        mint="M" * 12, symbol="CAT", name="Cat Coin",
+        unique_buyers=6, curve_progress=0.11, created_timestamp=time.time() - 150,
+    )
+    record = log.promote(token, detail="buyers=6 age=150s curve=0.110")
+    assert record["type"] == "promote"
+    assert record["mode"] == "dry-run"
+    assert record["stage"] == "monitor"
+    assert record["reason"] == "ok"
+    assert record["detail"] == "buyers=6 age=150s curve=0.110"
+    assert record["token"]["unique_buyers"] == 6
+    assert record["token"]["curve_progress"] == 0.11
 
 
 def test_intent_record_precedes_purchase(tmp_path):

@@ -158,7 +158,7 @@ python scripts/dashboard.py logs/trades.jsonl --watch 5
 | поле | смысл | когда плохо |
 |---|---|---|
 | `status` | сводка | `degraded` = цепь разомкнута или поток встал |
-| `stalled` | нет событий из сокета дольше 10 минут | `true` — сокет мёртв |
+| `stalled` | нет create/skip/promote дольше 10 минут | `true` — сокет мёртв |
 | `breaker` | `closed` / `half-open` / `open` | `open` — Grok не отвечает |
 | `grok_budget_remaining` | остаток дневных вызовов | 0 — до полуночи UTC агенты молчат |
 | `halted` | дневной лимит убытка выбран | `true` — торговли сегодня не будет |
@@ -206,10 +206,50 @@ xAI, нет ли 429. Цепь замкнётся сама после кулда
 
 ### `stalled: true`
 
-Из сокета не приходило событий дольше десяти минут. Монитор
+Из сокета не приходило **сообщений** (create / skip / promote) дольше
+десяти минут. Skip на мониторе тоже живость: иначе `/healthz` висел
+`unhealthy`, пока хоть один лонч не доходил до Grok. Монитор
 переподключается сам с нарастающей паузой; если `stalled` держится —
 проверить `data.ws_url` и сеть. Открытые позиции при этом всё ещё под
 присмотром стоп-лосса: он ходит по REST, а не по сокету.
+
+### Monitor never promotes (all `stale_no_traction`)
+
+If `trades.jsonl` is only `type=skip stage=monitor reason=stale_no_traction`
+and `detail` shows `buyers=0`, the trade tape is not landing. After 0.4.2
+the monitor resubscribes the whole pending buffer and REST-fills buyers
+for age-ready tokens. Gates are unchanged (5 buyers, 120s, curve under 40%).
+
+**How to tell the fix worked** (dry-run, no wallet):
+
+```json
+{"type":"promote","mode":"dry-run","stage":"monitor","reason":"ok",
+ "detail":"buyers=6 age=131s curve=0.041","symbol":"CAT",
+ "token":{"unique_buyers":6,"age_seconds":131,"curve_progress":0.041}}
+```
+
+A later paper buy looks like:
+
+```json
+{"type":"buy","mode":"dry-run","tx_hash":"dry_run","size_sol":0.05,
+ "scores":{"total":0.72},"token":{"unique_buyers":6,"age_seconds":140}}
+```
+
+`intent` then `buy` with `tx_hash=dry_run` is the paper fill. `mode` must
+stay `dry-run`. `curve_too_full` skips are expected for bonding-curve
+graduates — those are not the bug.
+
+```bash
+# on the VPS, after a crewvet image rebuild (do NOT Hostinger Update/Start)
+docker exec grokbot-pumpfun grep -E '"type": "promote"|"type": "buy"' /app/logs/trades.jsonl | tail
+docker logs grokbot-pumpfun 2>&1 | grep -E 'разбираем|КУПЛЕНО'
+curl -s localhost:18080/healthz | jq '{status,stalled,pending_launches,trades_today,grok_tokens_in}'
+```
+
+Hostinger **Update** / **Start** reclones GitHub and wipes env. Restart
+after rebuild is `docker stop` / `docker rm` / the same `docker run` or
+compose up against the already-built `grokbot-pumpfun:latest`, keeping
+`/opt/grokbot/secrets.env` and the log/state volumes.
 
 ### `blind_positions` больше нуля
 
