@@ -56,7 +56,11 @@ class Token(BaseModel):
 
     @property
     def has_metadata(self) -> bool:
-        return bool(self.name) and bool(self.image_uri)
+        # PumpPortal subscribeNewToken create events typically include
+        # name/symbol/uri and not a separate image field. The picture lives
+        # in the Metaplex JSON at `uri`. Requiring image_uri here skipped
+        # every live launch as no_metadata (163/163 on 2026-08-30).
+        return bool(self.name) and bool(self.image_uri or self.metadata_uri)
 
     @property
     def has_socials(self) -> bool:

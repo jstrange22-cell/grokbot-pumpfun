@@ -155,10 +155,56 @@ def parse_trade(raw: dict[str, Any]) -> Trade:
     )
 
 
+def resolve_metadata_url(uri: str) -> str:
+    """ipfs://CID → публичный HTTP-шлюз. https остаётся как есть."""
+    if uri.startswith("ipfs://"):
+        cid = uri[len("ipfs://"):].lstrip("/")
+        return f"https://ipfs.io/ipfs/{cid}"
+    return uri
+
+
+def apply_offchain_metadata(token: Token, info: dict[str, Any]) -> Token:
+    """Поля из Metaplex-JSON по `uri`: имя, тикер, картинка, соцсети."""
+    if not info:
+        return token
+    token.name = token.name or info.get("name")
+    token.symbol = token.symbol or info.get("symbol")
+    token.description = token.description or info.get("description")
+    token.image_uri = token.image_uri or info.get("image_uri") or info.get("image")
+    token.twitter = token.twitter or info.get("twitter")
+    token.telegram = token.telegram or info.get("telegram")
+    token.website = token.website or info.get("website")
+    return token
+
+
+async def fetch_offchain_metadata(
+    uri: str,
+    request_timeout: float = 10.0,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Скачать JSON по `uri`. Без API-ключа: это публичный файл, не data API."""
+    url = resolve_metadata_url(uri)
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=request_timeout)
+    try:
+        resp = await http.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.warning("офчейн-метаданные %s не прочитались: %s", uri, exc)
+        return {}
+    finally:
+        if owns_client:
+            await http.aclose()
+
+
 def enrich_token(token: Token, info: dict[str, Any]) -> Token:
     """Дописать в токен то, чего не было в событии сокета."""
     if not info:
         return token
+    token.name = token.name or info.get("name")
+    token.symbol = token.symbol or info.get("symbol")
     token.description = token.description or info.get("description")
     token.image_uri = token.image_uri or info.get("image_uri") or info.get("image")
     token.twitter = token.twitter or info.get("twitter")

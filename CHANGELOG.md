@@ -3,6 +3,17 @@
 Формат: что изменилось и почему это имело значение. Версии — по смыслу, а
 не по расписанию.
 
+## 0.4.1 — 2026-08-30
+
+- **PumpPortal create events were all skipped as `no_metadata`.**
+  `Token.has_metadata` required `image_uri`, but `subscribeNewToken` typically
+  sends `name`/`symbol`/`uri` and no separate image field. The picture lives
+  in the metadata JSON at `uri`. A name plus `metadata_uri` now counts; the
+  image is no longer required on the wire. `require_metadata` stays on.
+- If the socket also omits `name`, the monitor fetches that JSON from `uri`
+  (public HTTP/IPFS, no `data.api_key`) and fills identity fields. Fetch
+  failure stays fail-closed: still `no_metadata`.
+
 ## 0.4.0 — 2026-08-30
 
 ATLAS desk: dry-run remains the only default; live buy/sell sits behind

@@ -22,6 +22,7 @@ from typing import Any
 
 import websockets
 
+from .analyzer import apply_offchain_metadata, fetch_offchain_metadata
 from .curve import CURVE_COMPLETION_SOL, progress_from_sol
 from .models import Config, FilterConfig, Token
 
@@ -163,6 +164,21 @@ class LaunchMonitor:
 
         return self._promote(token)
 
+    async def enrich_from_uri(self, token: Token) -> Token:
+        """Если сокет не дал имя, взять его из JSON по `uri`.
+
+        Без data.api_key: это публичный Metaplex-файл (часто IPFS), не
+        платный REST провайдера. Падаем мягко — без имени фильтр всё
+        равно отсечёт как no_metadata.
+        """
+        if token.name or not token.metadata_uri:
+            return token
+        info = await fetch_offchain_metadata(
+            token.metadata_uri,
+            request_timeout=self.config.data.request_timeout,
+        )
+        return apply_offchain_metadata(token, info)
+
     def _promote(self, token: Token) -> Token | None:
         """Проверить дозревший токен и вынуть его из буфера, если решение принято."""
         ok, reason = passes_filter(token, self.filter)
@@ -238,7 +254,10 @@ class LaunchMonitor:
                                     await self._subscribe_trades(ws, token.mint, off=True)
                                     yield token
                                 elif payload.get("txType") in ("create", "created"):
-                                    mint = payload.get("mint")
+                                    mint = payload.get("mint") or payload.get("mintAddress")
+                                    pending = self.pending.get(mint) if mint else None
+                                    if pending is not None:
+                                        await self.enrich_from_uri(pending)
                                     if mint:
                                         await self._subscribe_trades(ws, mint)
                         if time.time() - last_sweep >= sweeper_delay:
