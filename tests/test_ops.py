@@ -166,6 +166,22 @@ def test_budget_restores_spent_count():
     assert not budget.try_spend()
 
 
+def test_budget_can_spend_does_not_consume():
+    budget = CallBudget(max_per_day=1, clock=FakeClock())
+    assert budget.can_spend()
+    assert budget.spent == 0
+    assert budget.try_spend()
+    assert not budget.can_spend()
+
+
+def test_entry_veto_ready_when_budget_exhausted(config):
+    config.ops.max_grok_calls_per_day = 1
+    ops = GrokOps(config, spent=1)
+    ready, why = ops.entry_veto_ready()
+    assert not ready
+    assert why == "grok_budget_exhausted"
+
+
 # --- метрики --------------------------------------------------------------
 
 

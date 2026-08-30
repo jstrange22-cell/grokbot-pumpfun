@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from .curve import CurveState
 
@@ -44,6 +44,10 @@ class Token(BaseModel):
     created_timestamp: float = 0.0
 
     unique_buyers: int = 0
+    # Реальные уникальные покупатели с WS или REST-ленты. 0, если монитор
+    # только вывел unique_buyers из публичной карточки (last_trade / reserve).
+    ws_buyers: int = 0
+    buyers_inferred: bool = False
     curve_progress: float = 0.0          # 0..1, доля выкупленной кривой
     market_cap_sol: float = 0.0
     sol_in_curve: float = 0.0
@@ -339,7 +343,14 @@ class MarketConfig(BaseModel):
     max_round_trip_cost_pct: float = 5.0  # вход плюс выход дороже этого — мимо
 
 
+# 0.0 daily_loss_limit_sol halts the book immediately (loss 0 >= limit 0).
+# That is "no trades", not unlimited. Coerce to the ATLAS envelope.
+ENVELOPE_DAILY_LOSS_SOL = 0.1
+
+
 class RiskConfig(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     max_sol_per_trade: float = 0.5
     daily_loss_limit_sol: float = 2.0
     max_trades_per_day: int = 20
@@ -354,6 +365,14 @@ class RiskConfig(BaseModel):
     take_profit_fraction: float = 0.6     # какую долю продать на take-profit
     trailing_stop_pct: float = 35.0       # откат от пика, считается только выше входа
     max_hold_seconds: float = 3600.0      # мемкоин, который час не поехал, не поедет
+
+    @field_validator("daily_loss_limit_sol")
+    @classmethod
+    def zero_daily_loss_is_halted(cls, value: float) -> float:
+        """0 останавливает книгу (0 >= 0). Это не безлимит — ставим конверт 0.1."""
+        if value == 0:
+            return ENVELOPE_DAILY_LOSS_SOL
+        return value
 
 
 class FilterConfig(BaseModel):
@@ -412,11 +431,14 @@ class OpsConfig(BaseModel):
     health_host: str = "127.0.0.1"
     heartbeat_seconds: float = 300.0          # строка живости в лог
     shutdown_grace_seconds: float = 30.0      # сколько ждать токены в работе
-    max_grok_calls_per_day: int = 2000        # потолок расхода на агентов
+    max_grok_calls_per_day: int = 2000        # потолок, если включено вето
     grok_max_concurrency: int = 4
     grok_calls_per_minute: int = 60
     breaker_failures: int = 8                 # подряд, до размыкания
     breaker_cooldown_seconds: float = 120.0
+    # Вход механический. Grok — не больше одного вето после прохода,
+    # по умолчанию выключен: SuperGrok не должен мести pump.fun.
+    grok_entry_veto: bool = False
 
 
 # --------------------------------------------------------------------------
@@ -528,10 +550,16 @@ class Config(BaseModel):
         warnings: list[str] = []
 
         if is_placeholder(self.grok.key):
-            errors.append(
-                "grok.api_key не задан (или остался плейсхолдером) — "
-                "без него не работает ни один агент, включая dry-run"
-            )
+            if self.ops.grok_entry_veto:
+                errors.append(
+                    "grok.api_key не задан (или остался плейсхолдером) — "
+                    "ops.grok_entry_veto включён, без ключа вето не вызвать"
+                )
+            else:
+                warnings.append(
+                    "grok.api_key не задан — вход механический, вето выключено. "
+                    "Ключ нужен только если включите ops.grok_entry_veto"
+                )
         for name in ("fast_model", "checker_model"):
             if not getattr(self.grok, name).strip():
                 errors.append(f"grok.{name} пустой")
@@ -651,7 +679,7 @@ class Config(BaseModel):
         if flt.min_total_score < 0.5:
             warnings.append(
                 f"filter.min_total_score = {flt.min_total_score} — низкий порог, "
-                "до чекера дойдёт заметно больше токенов и вырастет расход"
+                "механический вход пропустит больше клипов на одно место"
             )
         return errors, warnings
 
@@ -684,5 +712,6 @@ class Config(BaseModel):
             f"risk={self.risk.max_sol_per_trade}SOL/сделка "
             f"limit={self.risk.daily_loss_limit_sol}SOL/день "
             f"score>={self.filter.min_total_score} "
+            f"grok_veto={'on' if self.ops.grok_entry_veto else 'off'} "
             f"state={self.ops.state_path}"
         )

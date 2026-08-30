@@ -98,13 +98,14 @@ def test_placeholder_detection():
 # --- проверки перед стартом ----------------------------------------------
 
 
-def test_example_config_is_rejected_as_is():
-    """config.example.yaml с плейсхолдерами не должен стартовать."""
+def test_example_config_warns_placeholder_key_when_veto_off():
+    """Вход механический: плейсхолдер Grok — предупреждение, не отказ."""
     cfg = Config.load("config.example.yaml", env={})
-    errors, _ = cfg.problems()
-    assert any("grok.api_key" in e for e in errors)
-    with pytest.raises(ConfigError):
-        cfg.check_ready()
+    errors, warnings = cfg.problems()
+    assert not any("grok.api_key" in e for e in errors)
+    assert any("grok.api_key" in w for w in warnings)
+    assert cfg.ops.grok_entry_veto is False
+    assert isinstance(cfg.check_ready(), list)
 
 
 def test_good_config_passes():
@@ -181,11 +182,34 @@ def test_default_mode_is_dry_run():
     assert not Config().is_live
 
 
-def test_atlas_template_stays_dry_run_and_rejects_placeholders():
+def test_atlas_template_stays_dry_run_mechanical_entry():
     cfg = Config.load("config.atlas.yaml", env={})
     assert cfg.mode == "dry-run"
     assert cfg.risk.max_open_positions == 1
+    assert cfg.ops.grok_entry_veto is False
+    errors, warnings = cfg.problems()
+    assert not any("grok.api_key" in e for e in errors)
+    assert any("grok.api_key" in w for w in warnings)
+
+
+def test_zero_daily_loss_coerces_to_envelope():
+    """0 останавливает книгу (0 >= 0). Это не безлимит — ставим 0.1."""
+    from src.models import ENVELOPE_DAILY_LOSS_SOL, RiskConfig
+
+    assert RiskConfig(daily_loss_limit_sol=0).daily_loss_limit_sol == ENVELOPE_DAILY_LOSS_SOL
+    cfg = config(risk={"daily_loss_limit_sol": 0})
+    assert cfg.risk.daily_loss_limit_sol == ENVELOPE_DAILY_LOSS_SOL
+    errors, _ = cfg.problems()
+    assert not any("daily_loss_limit_sol" in e for e in errors)
+
+
+def test_grok_veto_requires_key():
+    cfg = Config.from_raw({"ops": {"grok_entry_veto": True}}, env={})
     errors, _ = cfg.problems()
     assert any("grok.api_key" in e for e in errors)
     with pytest.raises(ConfigError):
         cfg.check_ready()
+
+
+def test_default_entry_does_not_call_for_grok_veto():
+    assert Config().ops.grok_entry_veto is False

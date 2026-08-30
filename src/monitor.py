@@ -286,6 +286,8 @@ class LaunchMonitor:
         if _is_buy_event(payload) and wallet and wallet != token.creator:
             self._buyers[mint].add(wallet)
         token.unique_buyers = len(self._buyers[mint])
+        token.ws_buyers = token.unique_buyers
+        token.buyers_inferred = False
 
         sol_in_curve = payload.get("vSolInBondingCurve")
         if sol_in_curve is not None:
@@ -396,13 +398,17 @@ class LaunchMonitor:
             if trade.is_buy and trade.wallet and trade.wallet != token.creator:
                 buyers.add(trade.wallet)
         token.unique_buyers = len(buyers)
+        token.ws_buyers = len(buyers)
+        token.buyers_inferred = False
         # v3 /trades 404 без JWT: карточка всё равно показывает, что
-        # торги уже были. Иначе unique_buyers=0 и Grok не вызывается.
+        # торги уже были. Иначе unique_buyers=0 и лонч не доходит до входа.
+        # Это не живые кошельки — ws_buyers не поднимаем.
         if (
             token.unique_buyers < self.filter.min_unique_buyers
             and coin_card_has_traction(info)
         ):
             token.unique_buyers = self.filter.min_unique_buyers
+            token.buyers_inferred = True
 
     async def _default_rest_fetch(
         self, mint: str
