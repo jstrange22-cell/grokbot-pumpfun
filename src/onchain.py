@@ -3,8 +3,9 @@
 Инструкция — классическая `buy` / `sell` программы
 `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P`, с тем набором аккаунтов,
 который программа принимает сейчас (creator_vault, volume accumulator,
-fee_config). Это не снайпер и не бандл на дамп: один кошелёк, одна
-покупка или продажа, потом ждать подтверждения.
+fee_config, плюс remaining: bonding_curve_v2 и buyback fee recipient).
+Это не снайпер и не бандл на дамп: один кошелёк, одна покупка или
+продажа, потом ждать подтверждения.
 
 Любая неопределённость — отказ, а не догадка: нет ключа, нет аккаунта
 кривой, RPC молчит, подтверждения нет — сделка не считается исполненной.
@@ -36,6 +37,8 @@ log = logging.getLogger(__name__)
 
 PUMP_PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 FEE_PROGRAM = Pubkey.from_string("pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ")
+# Apr/May 2026 remaining account. Verified on this desk's sell_v2 dumps.
+BUYBACK_FEE_RECIPIENT = Pubkey.from_string("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD")
 SYSTEM_PROGRAM = Pubkey.from_string("11111111111111111111111111111111")
 TOKEN_PROGRAM = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 TOKEN_2022_PROGRAM = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
@@ -76,6 +79,7 @@ _B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 __all__ = [
     "DEFAULT_SLIPPAGE",
     "LAMPORTS_PER_SOL",
+    "BUYBACK_FEE_RECIPIENT",
     "PUMP_PROGRAM",
     "TOKEN_DECIMALS",
     "AccountInfo",
@@ -145,6 +149,7 @@ class Accounts:
     global_volume_accumulator: Pubkey
     user_volume_accumulator: Pubkey
     fee_config: Pubkey
+    bonding_curve_v2: Pubkey
 
 
 def b58encode(data: bytes) -> str:
@@ -248,6 +253,7 @@ def derive_accounts(
         global_volume_accumulator=_pda([b"global_volume_accumulator"], PUMP_PROGRAM),
         user_volume_accumulator=_pda([b"user_volume_accumulator", bytes(user)], PUMP_PROGRAM),
         fee_config=_pda([b"fee_config", bytes(PUMP_PROGRAM)], FEE_PROGRAM),
+        bonding_curve_v2=_pda([b"bonding-curve-v2", bytes(mint)], PUMP_PROGRAM),
     )
 
 
@@ -325,6 +331,7 @@ def build_buy_instruction(accounts: Accounts, amount: int, max_sol_cost: int) ->
         _meta(accounts.user_volume_accumulator, writable=True),
         _meta(accounts.fee_config),
         _meta(FEE_PROGRAM),
+        *_remaining_buyback_accounts(accounts),
     ]
     return Instruction(PUMP_PROGRAM, encode_buy(amount, max_sol_cost), keys)
 
@@ -346,8 +353,17 @@ def build_sell_instruction(accounts: Accounts, amount: int, min_sol_output: int)
         _meta(PUMP_PROGRAM),
         _meta(accounts.fee_config),
         _meta(FEE_PROGRAM),
+        *_remaining_buyback_accounts(accounts),
     ]
     return Instruction(PUMP_PROGRAM, encode_sell(amount, min_sol_output), keys)
+
+
+def _remaining_buyback_accounts(accounts: Accounts) -> list[AccountMeta]:
+    """Apr/May 2026 remaining accounts. Без них live buy даёт 0x17ae (6062)."""
+    return [
+        _meta(accounts.bonding_curve_v2),
+        _meta(BUYBACK_FEE_RECIPIENT, writable=True),
+    ]
 
 
 def create_ata_idempotent(

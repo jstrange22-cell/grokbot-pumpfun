@@ -10,6 +10,7 @@ from solders.signature import Signature
 
 from src.onchain import (
     BUY_DISCRIMINATOR,
+    BUYBACK_FEE_RECIPIENT,
     DEFAULT_SLIPPAGE,
     FEE_PROGRAM,
     LAMPORTS_PER_SOL,
@@ -135,6 +136,8 @@ def test_derive_accounts_are_deterministic():
     assert a == b
     assert a.global_account == Pubkey.from_string("4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf")
     assert a.event_authority == Pubkey.from_string("Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1")
+    expected_v2 = Pubkey.find_program_address([b"bonding-curve-v2", bytes(mint)], PUMP_PROGRAM)[0]
+    assert a.bonding_curve_v2 == expected_v2
 
 
 def test_buy_and_sell_account_order_differs():
@@ -146,14 +149,39 @@ def test_buy_and_sell_account_order_differs():
     sell = build_sell_instruction(acc, 1, 2)
     assert buy.program_id == PUMP_PROGRAM
     assert sell.program_id == PUMP_PROGRAM
-    assert len(buy.accounts) == 16
-    assert len(sell.accounts) == 14
+    assert len(buy.accounts) == 18
+    assert len(sell.accounts) == 16
     # buy: token_program затем creator_vault; sell — наоборот
     assert buy.accounts[8].pubkey == TOKEN_PROGRAM
     assert buy.accounts[9].pubkey == acc.creator_vault
     assert sell.accounts[8].pubkey == acc.creator_vault
     assert sell.accounts[9].pubkey == TOKEN_PROGRAM
     assert buy.accounts[15].pubkey == FEE_PROGRAM
+    assert sell.accounts[13].pubkey == FEE_PROGRAM
+
+
+def test_buy_and_sell_append_buyback_remaining_accounts():
+    """Live sim fails 0x17ae (6062 BuybackFeeRecipientMissing) without these."""
+    mint = Keypair().pubkey()
+    acc = derive_accounts(
+        mint, Keypair().pubkey(), Keypair().pubkey(),
+        Keypair().pubkey(), TOKEN_PROGRAM,
+    )
+    expected_v2 = Pubkey.find_program_address([b"bonding-curve-v2", bytes(mint)], PUMP_PROGRAM)[0]
+    assert acc.bonding_curve_v2 == expected_v2
+    buy = build_buy_instruction(acc, 1, 2)
+    sell = build_sell_instruction(acc, 1, 2)
+    for ix in (buy, sell):
+        assert len(ix.accounts) >= 2
+        v2, recipient = ix.accounts[-2], ix.accounts[-1]
+        assert v2.pubkey == expected_v2
+        assert not v2.is_writable
+        assert not v2.is_signer
+        assert recipient.pubkey == BUYBACK_FEE_RECIPIENT
+        assert recipient.is_writable
+        assert not recipient.is_signer
+        assert ix.accounts[-3].pubkey == FEE_PROGRAM
+    assert str(BUYBACK_FEE_RECIPIENT) == "5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"
 
 
 def test_jito_tip_requires_positive_lamports():

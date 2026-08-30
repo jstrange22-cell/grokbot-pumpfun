@@ -464,8 +464,11 @@ Grok лежат в `state/pipeline.json` и поднимаются на стар
 trade: load the Keypair from `config.solana.wallet_private_key` (solders),
 derive bonding-curve accounts, create the buyer ATA if needed, set
 `max_sol_cost` / `min_sol_output` from `plan_*` plus 2% slippage,
-ComputeBudget, optional Jito tip+bundle, wait for confirmation. Missing
-key, RPC error, or no confirmation — fail closed, no position.
+ComputeBudget, optional Jito tip+bundle, wait for confirmation. Both
+`buy` and `sell` append remaining accounts `bonding_curve_v2` (readonly)
+and the buyback fee recipient (writable) after `fee_config` + FEE_PROGRAM;
+without them the program returns custom `0x17ae` (6062). Missing key, RPC
+error, or no confirmation — fail closed, no position.
 
 Live still requires `mode: live`, a real wallet key, and
 `--i-understand-the-risk`. Doctor refuses live without a key. Default

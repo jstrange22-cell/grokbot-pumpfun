@@ -3,6 +3,16 @@
 Формат: что изменилось и почему это имело значение. Версии — по смыслу, а
 не по расписанию.
 
+## 0.4.6 — 2026-08-30
+
+- **Live buy failed Instruction 3 custom 0x17ae (6062 BuybackFeeRecipientMissing).**
+  Classic `buy`/`sell` keys ended at `fee_config` + FEE_PROGRAM. The Apr/May
+  2026 pump.fun upgrade requires two trailing remaining accounts on both
+  sides: `bonding_curve_v2` PDA (readonly, seeds `[b"bonding-curve-v2", mint]`)
+  and buyback fee recipient `5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD`
+  (writable). Existing account order is unchanged. Envelope unchanged:
+  0.05 SOL/clip, 1 seat, Grok veto off, 0.1 SOL/day max loss.
+
 ## 0.4.5 — 2026-08-30
 
 - **Four Grok agents per coin burned the daily xAI budget at 0 fills.**
