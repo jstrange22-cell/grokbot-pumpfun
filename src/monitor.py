@@ -32,7 +32,15 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 import websockets
 
-from .analyzer import apply_offchain_metadata, enrich_token, fetch_offchain_metadata, parse_trade
+from .analyzer import (
+    apply_offchain_metadata,
+    enrich_token,
+    fetch_json,
+    fetch_offchain_metadata,
+    parse_trade,
+    rest_base_urls,
+    rows_from_payload,
+)
 from .curve import CURVE_COMPLETION_SOL, progress_from_sol
 from .models import Config, FilterConfig, Token, is_placeholder
 
@@ -303,8 +311,9 @@ class LaunchMonitor:
     async def refresh_from_rest(self, now: float | None = None) -> None:
         """Добрать покупателей и кривую, если сокет сделок молчит.
 
-        Публичный `data.rest_url`, без PumpPortal api-key: карточка и
-        сделки frontend-api. Только токены старше min_age, у которых
+        Публичный `data.rest_url` (v3 /coins), без PumpPortal api-key и
+        без JWT сайта. /trades на v3 — 404; покупателей добираем, если
+        хост ещё отдаёт ленту. Только токены старше min_age, у которых
         ещё не набралось покупателей. Сбой — тишина, не промоут.
         """
         now = now or time.time()
@@ -355,34 +364,19 @@ class LaunchMonitor:
     async def _default_rest_fetch(
         self, mint: str
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        base = self.config.data.rest_url.rstrip("/")
+        hosts = rest_base_urls(self.config.data.rest_url)
         timeout = self.config.data.request_timeout
         headers = {"Accept": "application/json"}
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            trades_raw: list[dict[str, Any]] = []
-            info: dict[str, Any] = {}
-            try:
-                resp = await client.get(
-                    f"{base}/trades/all/{mint}", params={"limit": REST_TRADE_LIMIT}
-                )
-                if resp.is_success:
-                    body = resp.json()
-                    if isinstance(body, list):
-                        trades_raw = [row for row in body if isinstance(row, dict)]
-                    elif isinstance(body, dict):
-                        rows = body.get("trades") or body.get("data") or []
-                        if isinstance(rows, list):
-                            trades_raw = [row for row in rows if isinstance(row, dict)]
-            except Exception as exc:
-                log.warning("REST сделки %s: %s", mint[:8], exc)
-            try:
-                resp = await client.get(f"{base}/coins/{mint}")
-                if resp.is_success:
-                    body = resp.json()
-                    if isinstance(body, dict):
-                        info = body
-            except Exception as exc:
-                log.warning("REST карточка %s: %s", mint[:8], exc)
+            # /trades на v3 — 404 без JWT сайта. Карточка /coins живая.
+            trades_body = await fetch_json(
+                client, f"/trades/all/{mint}", hosts, limit=REST_TRADE_LIMIT,
+            )
+            info_body = await fetch_json(
+                client, f"/coins/{mint}", hosts, retry_empty=True,
+            )
+        trades_raw = rows_from_payload(trades_body)
+        info = info_body if isinstance(info_body, dict) else {}
         return trades_raw, info
 
     def _forget(self, mint: str) -> None:

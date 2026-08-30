@@ -97,6 +97,17 @@ async def test_buy_falls_back_to_market_cap():
     assert result.token_amount > 0
 
 
+async def test_curve_falls_back_to_token_sol_in_curve():
+    """Пустой REST /coins — кривая из sol_in_curve, который уже есть на токене."""
+    executor = DryRunExecutor(config(), client({}))
+    tok = token(market_cap_sol=0.0, sol_in_curve=35.0)
+    state = await executor.curve(tok.mint, token=tok)
+    assert state is not None
+    assert state.real_sol == pytest.approx(5.0)
+    result = await executor.buy(tok, 0.2)
+    assert result.ok
+
+
 async def test_zero_size_refused():
     executor = DryRunExecutor(config(), client(LIVE_CURVE))
     assert not (await executor.buy(token(), 0.0)).ok
@@ -219,9 +230,14 @@ def _rpc_client(handler):
     return httpx.AsyncClient(transport=httpx.MockTransport(handler))
 
 
-def _pack_curve(creator, complete=False):
+def _pack_curve(creator, complete=False, virtual_sol=0, virtual_tokens=0):
+    import struct
 
     data = bytearray(120)
+    if virtual_tokens:
+        struct.pack_into("<Q", data, 8, virtual_tokens)
+    if virtual_sol:
+        struct.pack_into("<Q", data, 16, virtual_sol)
     data[48] = 1 if complete else 0
     data[49:81] = bytes(creator)
     return bytes(data)
@@ -257,6 +273,8 @@ def _live_rpc(
     rpc_down=False,
     complete=False,
     jito=False,
+    virtual_sol=0,
+    virtual_tokens=0,
 ):
     import json
 
@@ -266,7 +284,8 @@ def _live_rpc(
     store = {
         str(mint): _account_json(b"\x00" * 82, str(TOKEN_PROGRAM)),
         str(acc.bonding_curve): _account_json(
-            _pack_curve(creator, complete), str(acc.bonding_curve),
+            _pack_curve(creator, complete, virtual_sol, virtual_tokens),
+            str(acc.bonding_curve),
         ),
         str(acc.global_account): _account_json(_pack_global(fee), str(acc.global_account)),
     }
@@ -484,3 +503,25 @@ async def test_live_buy_refused_when_rpc_client_missing():
     result = await executor.buy(token(mint=str(Keypair().pubkey())), 0.4)
     assert not result.ok
     assert "RPC" in result.error
+
+
+async def test_live_curve_falls_back_to_onchain_when_rest_empty():
+    from solders.keypair import Keypair
+
+    wallet, secret = _live_wallet()
+    mint = Keypair()
+    handler, _seen, _acc = _live_rpc(
+        wallet=wallet, mint=mint.pubkey(), creator=Keypair().pubkey(),
+        fee=Keypair().pubkey(),
+        virtual_sol=45_000_000_000,
+        virtual_tokens=715_333_460_666_667,
+    )
+    executor = LiveExecutor(
+        _live_config(secret),
+        client({}),
+        rpc_client=_rpc_client(handler),
+    )
+    state = await executor.curve(str(mint.pubkey()))
+    assert state is not None
+    assert state.sol_reserves == pytest.approx(45.0)
+    assert state.real_sol == pytest.approx(15.0)

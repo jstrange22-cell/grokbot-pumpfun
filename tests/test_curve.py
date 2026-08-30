@@ -153,6 +153,19 @@ def test_state_from_any_gives_up_without_data():
     assert state_from_any({}, market_cap_sol=0.0) is None
 
 
+def test_state_from_any_falls_back_to_sol_in_curve():
+    from src.curve import INITIAL_VIRTUAL_SOL, real_sol_from_hint, state_from_sol_in_curve
+
+    state = state_from_any({}, market_cap_sol=0.0, sol_in_curve=35.0)
+    assert state is not None
+    assert state.real_sol == pytest.approx(5.0)
+    assert real_sol_from_hint(35.0) == pytest.approx(5.0)
+    assert real_sol_from_hint(5.0) == pytest.approx(5.0)
+    small = state_from_sol_in_curve(5.0)
+    assert small is not None
+    assert small.sol_reserves == pytest.approx(INITIAL_VIRTUAL_SOL + 5.0)
+
+
 # --- прогресс -------------------------------------------------------------
 
 

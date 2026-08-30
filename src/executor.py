@@ -23,6 +23,7 @@ from solders.instruction import Instruction
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 
+from .analyzer import client_primary_url, fetch_json, rest_base_urls
 from .curve import (
     TOTAL_SUPPLY,
     CurveState,
@@ -35,6 +36,7 @@ from .models import Config, Position, Token
 from .onchain import (
     DEFAULT_SLIPPAGE,
     LAMPORTS_PER_SOL,
+    TOKEN_PROGRAM,
     Accounts,
     BondingCurveOnchain,
     LiveClosed,
@@ -66,6 +68,7 @@ __all__ = [
     "ExecutionResult",
     "LiveExecutor",
     "build_executor",
+    "curve_state_from_account",
     "new_position",
     "price_from_reserves",
 ]
@@ -110,18 +113,30 @@ class BaseExecutor:
     async def _coin(self, mint: str) -> dict[str, Any]:
         if self._client is None:
             return {}
-        try:
-            resp = await self._client.get(f"/coins/{mint}")
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            log.warning("данные по %s недоступны: %s", mint, exc)
-            return {}
+        hosts = rest_base_urls(client_primary_url(self._client, self.config.data.rest_url))
+        data = await fetch_json(self._client, f"/coins/{mint}", hosts, retry_empty=True)
         return data if isinstance(data, dict) else {}
 
-    async def curve(self, mint: str, market_cap_sol: float = 0.0) -> CurveState | None:
-        """Состояние кривой сейчас. None, если восстановить не из чего."""
-        return state_from_any(await self._coin(mint), market_cap_sol)
+    async def curve(
+        self,
+        mint: str,
+        market_cap_sol: float = 0.0,
+        token: Token | None = None,
+    ) -> CurveState | None:
+        """Состояние кривой сейчас. None, если восстановить не из чего.
+
+        Порядок: REST-карточка (с запасным хостом), поля токена с сокета,
+        ончейн bonding curve (live). Пустой frontend-api не блокирует заявку.
+        """
+        cap = market_cap_sol or (token.market_cap_sol if token is not None else 0.0)
+        hint = token.sol_in_curve if token is not None else 0.0
+        state = state_from_any(await self._coin(mint), cap, sol_in_curve=hint)
+        if state is not None:
+            return state
+        return await self._curve_from_chain(mint)
+
+    async def _curve_from_chain(self, mint: str) -> CurveState | None:
+        return None
 
     async def price(self, mint: str) -> float:
         """Спотовая цена. Ею меряются правила выхода — они про движение рынка,
@@ -187,7 +202,7 @@ class DryRunExecutor(BaseExecutor):
     """Проходит весь путь, кроме отправки транзакции."""
 
     async def buy(self, token: Token, size_sol: float) -> ExecutionResult:
-        state = await self.curve(token.mint, token.market_cap_sol)
+        state = await self.curve(token.mint, token.market_cap_sol, token=token)
         if state is None:
             # Позиция с неизвестной ценой входа неуправляема: ни одно
             # правило выхода на ней не срабатывает.
@@ -276,6 +291,22 @@ class LiveExecutor(BaseExecutor):
             self._rpc_http = None
         await super().__aexit__(*exc)
 
+    async def _curve_from_chain(self, mint: str) -> CurveState | None:
+        """Резервы с аккаунта bonding_curve, тот же PDA что в _resolve_accounts."""
+        try:
+            rpc = self._rpc_or_fail()
+            mint_pk = pubkey_from_str(mint, "mint")
+            bonding = derive_accounts(
+                mint_pk, mint_pk, mint_pk, mint_pk, TOKEN_PROGRAM,
+            ).bonding_curve
+            info = await rpc.get_account(bonding)
+            if info is None:
+                return None
+            return curve_state_from_account(info.data)
+        except Exception as exc:
+            log.warning("ончейн-кривая %s: %s", mint[:8], exc)
+            return None
+
     def _rpc_or_fail(self) -> SolanaRpc:
         if self._rpc is not None:
             return self._rpc
@@ -312,7 +343,7 @@ class LiveExecutor(BaseExecutor):
 
     async def _buy(self, token: Token, size_sol: float) -> ExecutionResult:
         keypair = load_keypair(self.config.solana.wallet_key)
-        state = await self.curve(token.mint, token.market_cap_sol)
+        state = await self.curve(token.mint, token.market_cap_sol, token=token)
         if state is None:
             raise LiveClosed("состояние кривой неизвестно")
         if state.complete:
@@ -438,6 +469,19 @@ class LiveExecutor(BaseExecutor):
             impact_pct=planned.impact_pct,
             state_after=planned.state_after,
         )
+
+
+def curve_state_from_account(data: bytes) -> CurveState | None:
+    """Виртуальные резервы из сырого аккаунта bonding_curve."""
+    parsed = parse_bonding_curve(data)
+    if not parsed.virtual_sol_reserves or not parsed.virtual_token_reserves:
+        return None
+    state = CurveState(
+        sol_reserves=parsed.virtual_sol_reserves / 1e9,
+        token_reserves=parsed.virtual_token_reserves / 1e6,
+        complete=parsed.complete,
+    )
+    return state if state.is_valid else None
 
 
 def build_executor(config: Config, client: httpx.AsyncClient | None = None) -> BaseExecutor:

@@ -37,7 +37,9 @@ solana:
 
 data:
   api_key: "YOUR-DATA-PROVIDER-KEY"
-  rest_url: "https://frontend-api.pump.fun"
+  # v1 frontend-api.pump.fun is Cloudflare 1016 / HTTP 530.
+  # v3 /coins/{mint} is public; /trades and /holders need a site JWT we do not have.
+  rest_url: "https://frontend-api-v3.pump.fun"
   ws_url: "wss://pumpportal.fun/api/data"
   request_timeout: 10
 

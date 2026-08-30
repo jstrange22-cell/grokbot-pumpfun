@@ -33,7 +33,7 @@ solana:
 
 data:
   api_key: "YOUR-DATA-PROVIDER-KEY"
-  rest_url: "https://frontend-api.pump.fun"
+  rest_url: "https://frontend-api-v3.pump.fun"
   ws_url: "wss://pumpportal.fun/api/data"
   request_timeout: 10
 

@@ -319,7 +319,9 @@ class SolanaConfig(SecretModel):
 
 class DataConfig(SecretModel):
     api_key: SecretStr = SecretStr("")
-    rest_url: str = "https://frontend-api.pump.fun"
+    # frontend-api.pump.fun is Cloudflare 1016 / HTTP 530 (2026-08-30).
+    # v3 /coins/{mint} is public; /trades and /holders 404 without a site JWT.
+    rest_url: str = "https://frontend-api-v3.pump.fun"
     ws_url: str = "wss://pumpportal.fun/api/data"
     request_timeout: float = 10.0
 

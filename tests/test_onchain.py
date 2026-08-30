@@ -94,10 +94,21 @@ def test_parse_bonding_curve_reads_creator_and_refuses_non_sol():
     parsed = parse_bonding_curve(_curve_bytes(creator))
     assert parsed.creator == creator
     assert not parsed.complete
+    assert parsed.virtual_sol_reserves == 0
     with pytest.raises(LiveClosed, match="не в SOL"):
         parse_bonding_curve(_curve_bytes(creator, quote=Keypair().pubkey()))
     wsol = parse_bonding_curve(_curve_bytes(creator, quote=WSOL_MINT))
     assert wsol.quote_mint == WSOL_MINT
+
+
+def test_parse_bonding_curve_reads_virtual_reserves():
+    creator = Keypair().pubkey()
+    data = bytearray(_curve_bytes(creator))
+    struct.pack_into("<Q", data, 8, 715_333_460_666_667)
+    struct.pack_into("<Q", data, 16, 45_000_000_000)
+    parsed = parse_bonding_curve(bytes(data))
+    assert parsed.virtual_sol_reserves == 45_000_000_000
+    assert parsed.virtual_token_reserves == 715_333_460_666_667
 
 
 def test_parse_fee_recipient_fails_closed():
