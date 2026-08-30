@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 # События, которые умеет слать пайплайн. Набор в конфиге — подмножество.
 KNOWN_EVENTS = (
     "started", "stopped", "buy", "close", "rug",
-    "breaker", "halted", "stalled", "blind", "cooldown",
+    "breaker", "halted", "stalled", "blind", "cooldown", "killed",
 )
 
 

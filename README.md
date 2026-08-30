@@ -7,9 +7,44 @@
 Смысл конструкции в порядке ступеней: дешёвые фильтры стоят раньше дорогих,
 и до сильной модели доходит доля процента потока.
 
-**Исполнение сделок намеренно оставлено заглушкой.** Код, отправляющий
-транзакции вашим ключом, здесь не сгенерирован — см. [Executor](#executor).
-По умолчанию проект работает в `dry-run`.
+**Default mode is `dry-run`.** `LiveExecutor` can send a real pump.fun
+bonding-curve buy/sell, but live still requires `mode: live`, a real wallet
+key, and `--i-understand-the-risk`. ATLAS keeps dry-run until a human writes
+`promote`. See [ATLAS desk](#atlas-desk).
+
+## ATLAS desk
+
+Jason's fork, paper first. English is the desk language for ops.
+
+- **One crypto seat (FOMO).** `config.atlas.yaml` caps the book at
+  `max_open_positions: 1`, `max_sol_per_trade: 0.05`,
+  `max_total_exposure_sol: 0.05`, `daily_loss_limit_sol: 0.1`,
+  `max_trades_per_day: 10`. Separate from Kraken atlas-p1.
+- **Dry-run until promote.** `mode: dry-run` is the only runnable default.
+  Promote is a human step: dedicated hot wallet (never a Phantom/SafePal
+  seed), real key in the environment, `--i-understand-the-risk`. Do not
+  flip live in a committed file.
+- **Kill switch.** If `KILL` exists (or `$GROKBOT_KILL_FILE`, default
+  `./KILL`), the pipeline does not open new buys. Exits on open positions
+  still run. `touch KILL` / `rm KILL`.
+- **No manipulation helpers.** Single-wallet buy/sell plus the existing
+  pipeline. No bundle-snipe-and-dump, no wash, no spoofing, no multi-wallet.
+
+```bash
+cp config.atlas.yaml config.yaml          # placeholders only; add keys via env
+export GROKBOT_GROK_API_KEY=xai-...
+grokbot doctor --config config.yaml
+grokbot run --config config.yaml          # dry-run
+
+# Docker
+cp .env.example .env && $EDITOR .env
+mkdir -p config logs state && cp config.atlas.yaml config/config.yaml
+docker compose up -d && docker compose logs -f
+touch state/KILL                          # stop new buys; exits continue
+rm state/KILL
+```
+
+Ops detail: [RUNBOOK.md](RUNBOOK.md).
 
 ## Архитектура
 
@@ -66,7 +101,7 @@
 ┌───────────────────────────────▼───────────────────────────────┐
 │ 9. ИСПОЛНЕНИЕ         по математике кривой: комиссия,         │
 │    проскальзывание, влияние своей заявки на цену              │
-│    dry-run: tx_hash "dry_run" · live: заглушка по замыслу     │
+│    dry-run: tx_hash "dry_run" · live: buy/sell за гейтом      │
 └───────────────────────────────┬───────────────────────────────┘
                                 │
 ┌───────────────────────────────▼───────────────────────────────┐
@@ -91,6 +126,7 @@ grokbot-pumpfun/
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── config.example.yaml       # шаблон; config.yaml в .gitignore
+├── config.atlas.yaml         # ATLAS dry-run defaults, placeholders only
 ├── .env.example              # секреты для compose; .env в .gitignore
 ├── .github/workflows/ci.yml  # ruff + mypy + pytest на 3.11-3.13 + образ
 ├── src/
@@ -114,7 +150,9 @@ grokbot-pumpfun/
 │   ├── risk.py               # риск-менеджер и правила выхода
 │   ├── state.py              # состояние, переживающее рестарт
 │   ├── ops.py                # ограничители Grok, метрики, health, heartbeat
-│   ├── executor.py           # исполнение: dry-run рабочий, live — заглушка
+│   ├── executor.py           # dry-run по умолчанию; live — buy/sell за гейтом
+│   ├── onchain.py            # RPC/Jito и инструкция pump.fun
+│   ├── kill.py               # kill-switch: файл KILL закрывает новые покупки
 │   └── log.py                # JSONL-логирование с ротацией
 ├── tests/                    # pytest, в сеть не ходят
 └── scripts/
@@ -126,7 +164,7 @@ grokbot-pumpfun/
 ## Quick start
 
 ```bash
-git clone https://github.com/zostaff/grokbot-pumpfun.git
+git clone https://github.com/jstrange22-cell/grokbot-pumpfun.git
 cd grokbot-pumpfun
 
 make dev                     # venv, зависимости, линтер и тесты
@@ -421,20 +459,24 @@ Grok лежат в `state/pipeline.json` и поднимаются на стар
 | `GROKBOT_STATE_PATH` | файл состояния |
 | `GROKBOT_HEALTH_PORT` | порт health-эндпоинта, 0 — выключить |
 | `GROKBOT_ALERT_WEBHOOK` | webhook для уведомлений (в нём обычно токен) |
+| `GROKBOT_KILL_FILE` | path of the kill file (default `./KILL`); if it exists, no new buys |
 
 Пустое значение переменной не затирает то, что в файле: в compose это
 частая ошибка.
 
 ## Executor
 
-`src/executor.py` — единственное место, оставленное незаконченным намеренно.
-`DryRunExecutor` работает полностью; `LiveExecutor.buy` и `.sell` поднимают
-`NotImplementedError`, а рядом лежит пошаговый список того, что нужно
-дописать: загрузка Keypair, аккаунты бондинговой кривой, ATA покупателя,
-расчёт `max_sol_cost` со проскальзыванием, инструкция программы pump.fun,
-ComputeBudget, отправка бандла в Jito с чаевыми, ожидание подтверждения.
+`DryRunExecutor` is the default path and is fully implemented.
+`LiveExecutor.buy` / `.sell` send a single-wallet pump.fun bonding-curve
+trade: load the Keypair from `config.solana.wallet_private_key` (solders),
+derive bonding-curve accounts, create the buyer ATA if needed, set
+`max_sol_cost` / `min_sol_output` from `plan_*` plus 2% slippage,
+ComputeBudget, optional Jito tip+bundle, wait for confirmation. Missing
+key, RPC error, or no confirmation — fail closed, no position.
 
-Чтение цены с кривой общее для обоих режимов и работает.
+Live still requires `mode: live`, a real wallet key, and
+`--i-understand-the-risk`. Doctor refuses live without a key. Default
+config remains dry-run.
 
 ## Логирование
 
@@ -530,6 +572,6 @@ CI гоняет линтер, типы и тесты на Python 3.11, 3.12 и 3
 коде, сбой провайдера данных или неудачный промпт стоят ровно столько,
 сколько лежит в кошельке.
 
-Работайте в `dry-run`, пока сами не прочитали каждую ступень. Live-часть не
-дописана намеренно: дописывая её, вы принимаете ответственность за то, что
-она делает с вашими средствами.
+Work in `dry-run` until you have read every stage. Live sends real
+transactions with your key. ATLAS does not enable live in committed
+config; promote is a human step.

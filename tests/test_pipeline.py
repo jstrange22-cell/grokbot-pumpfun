@@ -375,9 +375,8 @@ def test_check_flag_exits_without_running(tmp_path, capsys):
     assert "dry-run" in printed
 
 
-async def test_live_executor_stub_does_not_crash_the_pipeline(config):
-    """Заглушка live поднимает NotImplementedError — это отказ ступени с
-    громкой записью в лог, а не падение процесса и не тихая покупка."""
+async def test_live_executor_without_key_fails_closed(config):
+    """Live без ключа — отказ ступени, не падение процесса и не тихая покупка."""
     config.mode = "live"
     pipeline = Pipeline(config)
     wire(pipeline, APPROVE)
@@ -387,7 +386,8 @@ async def test_live_executor_stub_does_not_crash_the_pipeline(config):
     assert pipeline.risk.open_count == 0
     records = list(read_log(config.logging.path))
     assert records[-1]["stage"] == "executor"
-    assert records[-1]["reason"] == "executor_not_implemented"
+    assert records[-1]["reason"] == "execution_failed"
+    assert "ключа" in records[-1]["detail"]
 
 
 # --- полный жизненный цикл ------------------------------------------------
@@ -1019,6 +1019,39 @@ async def test_lock_released_after_shutdown(config):
     pipeline.lock.acquire()
     await pipeline.shutdown()
     assert not pipeline.lock.path.exists()
+
+
+async def test_kill_switch_blocks_new_buys(config, tmp_path, monkeypatch):
+    from src.kill import ENV_KILL_FILE
+
+    kill = tmp_path / "KILL"
+    kill.write_text("atlas")
+    monkeypatch.setenv(ENV_KILL_FILE, str(kill))
+
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    assert await pipeline.process(fresh_token()) is None
+    assert pipeline.risk.open_count == 0
+    records = list(read_log(config.logging.path))
+    assert records[-1]["reason"] == "kill_switch"
+    assert pipeline.status()["killed"] is True
+
+
+async def test_kill_switch_allows_exits(config, tmp_path, monkeypatch):
+    from src.kill import ENV_KILL_FILE
+
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    assert await pipeline.process(fresh_token()) is not None
+    assert pipeline.risk.open_count == 1
+
+    kill = tmp_path / "KILL"
+    kill.write_text("atlas")
+    monkeypatch.setenv(ENV_KILL_FILE, str(kill))
+
+    position = pipeline.risk.positions["Mint1111"]
+    await pipeline._sell(position, price=position.entry_price * 0.5)
+    assert pipeline.risk.open_count == 0
 
 
 async def test_cooldown_blocks_new_buys(config):

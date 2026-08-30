@@ -36,6 +36,7 @@ from .alerts import Notifier
 from .analyzer import Analyzer, compute_metrics, enrich_token
 from .curve import max_sol_for_impact, state_from_any
 from .executor import BaseExecutor, build_executor, new_position
+from .kill import is_killed, kill_file_path
 from .log import TradeLog, read_log, setup_logging
 from .market import MarketPulse
 from .models import Analysis, Config, ConfigError, Position, Token
@@ -123,7 +124,7 @@ class Pipeline:
         self._last_event_at = time.time()
         self._alerted: dict[str, bool] = {
             "breaker": False, "halted": False, "stalled": False,
-            "blind": False, "cooldown": False,
+            "blind": False, "cooldown": False, "killed": False,
         }
 
     # -- жизненный цикл ----------------------------------------------------
@@ -250,6 +251,12 @@ class Pipeline:
                 self.metrics.inc("skip_risk_halted")
                 self.trade_log.skip(token, stage="risk", reason="daily_loss_limit_hit")
                 continue
+            if is_killed():
+                # Новые покупки закрыты; watcher по открытым позициям живёт отдельно.
+                self.metrics.inc("skip_killed")
+                self.trade_log.skip(token, stage="risk", reason="kill_switch",
+                                    detail=str(kill_file_path()))
+                continue
             task = asyncio.create_task(self._guarded(token), name=f"token-{token.mint[:8]}")
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -270,6 +277,11 @@ class Pipeline:
 
     async def process(self, token: Token) -> Analysis | None:
         """Один токен от метрик до покупки. None, если отсеян."""
+        if is_killed():
+            return self._reject(
+                Analysis(token=token), stage="risk", reason="kill_switch",
+                detail=str(kill_file_path()),
+            )
         log.info("разбираем %s (%s), покупателей %d",
                  token.symbol or "?", token.mint[:8], token.unique_buyers)
         self.reputation.observe(token.creator)
@@ -337,6 +349,10 @@ class Pipeline:
 
         # 9. Исполнение. Намерение фиксируется до отправки: если процесс
         # умрёт между исполнением и учётом, след останется на диске.
+        # Kill-файл мог появиться, пока чекер думал — ещё раз, до intent.
+        if is_killed():
+            return self._reject(analysis, stage="risk", reason="kill_switch",
+                                detail=str(kill_file_path()))
         self._sync_counters()
         self.trade_log.intent(analysis, size_sol=decision.size_sol)
         try:
@@ -430,6 +446,11 @@ class Pipeline:
                 "стоп-лосс и take-profit по ним сейчас не работают",
                 "цены по позициям снова приходят",
             ),
+            "killed": (
+                bool(status["killed"]),
+                f"kill-switch: файл {kill_file_path()} есть — новые покупки закрыты",
+                "kill-switch снят, покупки снова разрешены лимитами",
+            ),
         }
         for name, (active, on_text, off_text) in edges.items():
             if active and not self._alerted[name]:
@@ -492,6 +513,7 @@ class Pipeline:
             "trades_today": self.risk.trades_today,
             "realized_pnl_sol": round(self.risk.realized_pnl_sol, 6),
             "halted": self.risk.halted,
+            "killed": is_killed(),
             "cooldown_left_seconds": round(self.risk.cooldown_left_seconds, 1),
             "losing_streak": self.risk.losing_streak,
             "breaker": breaker,

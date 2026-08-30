@@ -1,9 +1,9 @@
 """Исполнение сделок на Solana.
 
-ЗАГЛУШКА ПО ЗАМЫСЛУ в части отправки транзакций: `LiveExecutor` поднимает
-NotImplementedError, а рядом лежит список шагов, которые нужно дописать
-руками. Код, подписывающий транзакции приватным ключом, здесь не
-сгенерирован.
+`DryRunExecutor` — путь по умолчанию: считает ту же кривую, что и live,
+но транзакцию не отправляет. `LiveExecutor` собирает buy/sell pump.fun и
+шлёт её в RPC или Jito, но включается только при `mode: live` плюс флаг
+`--i-understand-the-risk` и настоящий ключ кошелька.
 
 Всё остальное настоящее и, что важнее, честное: dry-run исполняется по
 математике кривой из `curve.py` — с комиссией, с проскальзыванием и с
@@ -19,6 +19,9 @@ from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
+from solders.instruction import Instruction
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
 
 from .curve import (
     TOTAL_SUPPLY,
@@ -29,6 +32,28 @@ from .curve import (
     state_from_any,
 )
 from .models import Config, Position, Token
+from .onchain import (
+    DEFAULT_SLIPPAGE,
+    LAMPORTS_PER_SOL,
+    Accounts,
+    BondingCurveOnchain,
+    LiveClosed,
+    SolanaRpc,
+    budget_and_tip,
+    build_buy_instruction,
+    build_sell_instruction,
+    close_token_account,
+    create_ata_idempotent,
+    derive_accounts,
+    load_keypair,
+    parse_bonding_curve,
+    parse_fee_recipient,
+    pubkey_from_str,
+    sign_transaction,
+    sol_to_lamports,
+    token_program_from_mint,
+    tokens_to_raw,
+)
 
 log = logging.getLogger(__name__)
 
@@ -214,47 +239,204 @@ class DryRunExecutor(BaseExecutor):
 
 
 class LiveExecutor(BaseExecutor):
-    """Реальная отправка транзакций. Намеренно не реализована.
+    """Реальная отправка транзакций на бондинговую кривую pump.fun.
 
-    Расчёт заявки при этом уже готов: `plan_buy` и `plan_sell` дают и
-    ожидаемое количество токенов, и среднюю цену, и влияние на цену —
-    из них берутся `max_sol_cost` и `min_sol_output` с нужным допуском.
+    Считает заявку теми же `plan_buy` / `plan_sell`, что и dry-run: из них
+    берутся `max_sol_cost` и `min_sol_output` с допуском 1–2%. Дальше —
+    ключ, аккаунты кривой, ATA, ComputeBudget, опционально чаевые Jito,
+    подтверждение. Нет ключа, нет RPC, нет слота — отказ, не «ну почти».
     """
 
-    def __init__(self, config: Config, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        client: httpx.AsyncClient | None = None,
+        rpc_client: httpx.AsyncClient | None = None,
+        rpc: SolanaRpc | None = None,
+        slippage: float = DEFAULT_SLIPPAGE,
+    ) -> None:
         super().__init__(config, client)
         self.rpc_url = config.solana.rpc_url
         self.jito = config.solana.jito
+        self._rpc_http = rpc_client
+        self._owns_rpc = rpc_client is None and rpc is None
+        self._rpc = rpc
+        self.slippage = slippage
+
+    async def __aenter__(self) -> LiveExecutor:
+        await super().__aenter__()
+        if self._rpc is None and self._rpc_http is None:
+            self._rpc_http = httpx.AsyncClient(timeout=20.0)
+            self._owns_rpc = True
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        if self._owns_rpc and self._rpc_http is not None:
+            await self._rpc_http.aclose()
+            self._rpc_http = None
+        await super().__aexit__(*exc)
+
+    def _rpc_or_fail(self) -> SolanaRpc:
+        if self._rpc is not None:
+            return self._rpc
+        if self._rpc_http is None:
+            raise LiveClosed(
+                "RPC-клиент не создан — LiveExecutor нужно открывать через async with"
+            )
+        self._rpc = SolanaRpc(
+            self.rpc_url,
+            self._rpc_http,
+            jito_url=self.jito.block_engine_url if self.jito.enabled else "",
+        )
+        return self._rpc
 
     async def buy(self, token: Token, size_sol: float) -> ExecutionResult:
-        # TODO(live): покупка на бондинговой кривой pump.fun.
-        #  1. Загрузить Keypair из config.solana.wallet_private_key (solders.keypair).
-        #  2. Получить аккаунты кривой: bonding_curve, associated_bonding_curve,
-        #     global, fee_recipient — и создать ATA покупателя, если её нет.
-        #  3. Взять расчёт из self.plan_buy(state, size_sol): ожидаемые токены
-        #     и средняя цена уже посчитаны с комиссией и проскальзыванием.
-        #     max_sol_cost = size_sol * (1 + допуск), допуск порядка 1-2%.
-        #  4. Собрать инструкцию `buy` программы
-        #     6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P и ComputeBudget:
-        #     цену за юнит и лимит.
-        #  5. При config.solana.jito.enabled — добавить перевод чаевых
-        #     (jito.tip_lamports) на tip-аккаунт и отправить бандл на
-        #     jito.block_engine_url; иначе send_transaction через RPC.
-        #  6. Дождаться подтверждения, вернуть ExecutionResult с реальными
-        #     tx_hash, ценой исполнения и полученным количеством токенов.
-        #     Чаевые Jito вычесть из sol_amount: это тоже стоимость сделки.
-        raise NotImplementedError(
-            "LiveExecutor.buy не реализован намеренно: допишите отправку "
-            "транзакций сами, прежде чем включать mode: live"
-        )
+        try:
+            return await self._buy(token, size_sol)
+        except LiveClosed as exc:
+            log.error("live buy отказан: %s", exc)
+            return ExecutionResult(ok=False, error=str(exc))
+        except Exception as exc:
+            log.exception("live buy упал: %s", exc)
+            return ExecutionResult(ok=False, error=f"неожиданная ошибка: {exc}")
 
     async def sell(self, position: Position, fraction: float = 1.0) -> ExecutionResult:
-        # TODO(live): продажа. Та же схема, что и buy, но инструкция `sell`,
-        #  min_sol_output из self.plan_sell(state, tokens) с допуском вниз,
-        #  и закрытие ATA после полного выхода (при частичном — не закрывать).
-        raise NotImplementedError(
-            "LiveExecutor.sell не реализован намеренно: допишите отправку "
-            "транзакций сами, прежде чем включать mode: live"
+        try:
+            return await self._sell(position, fraction)
+        except LiveClosed as exc:
+            log.error("live sell отказан: %s", exc)
+            return ExecutionResult(ok=False, error=str(exc))
+        except Exception as exc:
+            log.exception("live sell упал: %s", exc)
+            return ExecutionResult(ok=False, error=f"неожиданная ошибка: {exc}")
+
+    async def _buy(self, token: Token, size_sol: float) -> ExecutionResult:
+        keypair = load_keypair(self.config.solana.wallet_key)
+        state = await self.curve(token.mint, token.market_cap_sol)
+        if state is None:
+            raise LiveClosed("состояние кривой неизвестно")
+        if state.complete:
+            raise LiveClosed("кривая уже закрыта, на Raydium этот исполнитель не ходит")
+
+        planned = self.plan_buy(state, size_sol)
+        if not planned.ok:
+            return planned
+
+        max_sol_cost = sol_to_lamports(size_sol * (1.0 + self.slippage))
+        amount = tokens_to_raw(planned.token_amount)
+        accounts, _curve = await self._resolve_accounts(token.mint, keypair.pubkey())
+        if _curve.complete:
+            raise LiveClosed("ончейн: кривая уже закрыта")
+
+        instructions = []
+        ata = await self._rpc_or_fail().get_account(accounts.associated_user)
+        if ata is None:
+            instructions.append(create_ata_idempotent(
+                keypair.pubkey(), keypair.pubkey(), accounts.mint, accounts.token_program,
+            ))
+        instructions.append(build_buy_instruction(accounts, amount, max_sol_cost))
+        return await self._send(
+            keypair, instructions, planned, spent_sol=size_sol, is_buy=True,
+        )
+
+    async def _sell(self, position: Position, fraction: float) -> ExecutionResult:
+        keypair = load_keypair(self.config.solana.wallet_key)
+        state = await self.curve(position.mint)
+        if state is None:
+            raise LiveClosed("состояние кривой неизвестно")
+        if state.complete:
+            # В dry-run здесь считают по споту. В live это уже не кривая:
+            # отправить sell в программу — бессмысленно, прикидкой торговать нельзя.
+            raise LiveClosed("кривая уже закрыта: live не продаёт по спотовой прикидке")
+
+        tokens = self._portion(position, fraction)
+        planned = self.plan_sell(state, tokens)
+        if not planned.ok:
+            return planned
+
+        min_sol = planned.sol_amount * (1.0 - self.slippage)
+        if min_sol <= 0:
+            raise LiveClosed("min_sol_output после допуска неположительный")
+        amount = tokens_to_raw(tokens)
+        accounts, _curve = await self._resolve_accounts(position.mint, keypair.pubkey())
+        if _curve.complete:
+            raise LiveClosed("ончейн: кривая уже закрыта")
+
+        instructions = [build_sell_instruction(
+            accounts, amount, sol_to_lamports(min_sol),
+        )]
+        full_exit = tokens >= position.token_amount * 0.999
+        if full_exit:
+            instructions.append(close_token_account(
+                accounts.associated_user, keypair.pubkey(),
+                keypair.pubkey(), accounts.token_program,
+            ))
+        return await self._send(
+            keypair, instructions, planned, spent_sol=planned.sol_amount, is_buy=False,
+        )
+
+    async def _resolve_accounts(
+        self, mint_str: str, user: Pubkey
+    ) -> tuple[Accounts, BondingCurveOnchain]:
+        rpc = self._rpc_or_fail()
+        mint = pubkey_from_str(mint_str, "mint")
+        mint_info = await rpc.get_account(mint)
+        if mint_info is None:
+            raise LiveClosed("mint на RPC не найден")
+        token_program = token_program_from_mint(mint_info)
+
+        bonding_curve = derive_accounts(
+            mint, user, user, user, token_program,
+        ).bonding_curve
+        curve_info = await rpc.get_account(bonding_curve)
+        if curve_info is None:
+            raise LiveClosed("аккаунт bonding_curve не найден")
+        curve = parse_bonding_curve(curve_info.data)
+
+        global_pda = derive_accounts(mint, user, curve.creator, user, token_program).global_account
+        global_info = await rpc.get_account(global_pda)
+        if global_info is None:
+            raise LiveClosed("global-аккаунт не найден")
+        fee_recipient = parse_fee_recipient(global_info.data, mayhem=curve.mayhem)
+        return derive_accounts(mint, user, curve.creator, fee_recipient, token_program), curve
+
+    async def _send(
+        self,
+        keypair: Keypair,
+        instructions: list[Instruction],
+        planned: ExecutionResult,
+        *,
+        spent_sol: float,
+        is_buy: bool,
+    ) -> ExecutionResult:
+        rpc = self._rpc_or_fail()
+        prepared, tip_lamports = budget_and_tip(
+            instructions,
+            keypair.pubkey(),
+            jito_enabled=self.jito.enabled,
+            tip_lamports=self.jito.tip_lamports,
+        )
+        blockhash = await rpc.get_latest_blockhash()
+        tx = sign_transaction(keypair, prepared, blockhash)
+        if self.jito.enabled:
+            signature = await rpc.send_jito_bundle(tx)
+        else:
+            signature = await rpc.send_transaction(tx)
+        await rpc.wait_confirmed(signature)
+
+        tip_sol = tip_lamports / LAMPORTS_PER_SOL
+        sol_amount = spent_sol + tip_sol if is_buy else max(0.0, planned.sol_amount - tip_sol)
+        tokens = planned.token_amount
+        price = (sol_amount / tokens) if tokens else planned.price
+        return ExecutionResult(
+            ok=True,
+            tx_hash=signature,
+            price=price,
+            token_amount=tokens,
+            sol_amount=sol_amount,
+            fee_sol=planned.fee_sol,
+            impact_pct=planned.impact_pct,
+            state_after=planned.state_after,
         )
 
 
