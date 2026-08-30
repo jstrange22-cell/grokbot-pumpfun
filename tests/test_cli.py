@@ -64,9 +64,16 @@ def test_check_accepts_good_config(config_file, capsys):
 
 def test_check_rejects_bad_config(tmp_path, capsys):
     path = tmp_path / "config.yaml"
-    path.write_text("mode: dry-run\n")                  # без ключа Grok
+    path.write_text("mode: dry-run\nrisk:\n  max_sol_per_trade: 0\n")
     assert main(["check", "--config", str(path)]) == 1
-    assert "api_key" in capsys.readouterr().err
+    assert "max_sol_per_trade" in capsys.readouterr().err
+
+
+def test_check_allows_missing_grok_key_when_veto_off(tmp_path, capsys):
+    path = tmp_path / "config.yaml"
+    path.write_text("mode: dry-run\n")
+    assert main(["check", "--config", str(path)]) == 0
+    assert "механический" in capsys.readouterr().err
 
 
 def test_missing_config_is_explained(tmp_path):
@@ -91,7 +98,7 @@ def test_doctor_json_output(config_file, capsys):
 
 def test_doctor_fails_on_bad_config(tmp_path, capsys):
     path = tmp_path / "config.yaml"
-    path.write_text("mode: dry-run\n")
+    path.write_text("mode: dry-run\nrisk:\n  max_sol_per_trade: 0\n")
     assert main(["doctor", "--config", str(path), "--offline"]) == 1
 
 

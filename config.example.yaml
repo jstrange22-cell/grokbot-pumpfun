@@ -39,7 +39,7 @@ data:
 
 risk:
   max_sol_per_trade: 0.5        # потолок SOL на одну сделку
-  daily_loss_limit_sol: 2.0     # дневной лимит убытка, при достижении стоп
+  daily_loss_limit_sol: 2.0     # дневной лимит убытка; 0 = стоп книги, станет 0.1
   max_trades_per_day: 20        # максимум сделок в день
   max_open_positions: 3         # максимум одновременно открытых позиций
   max_total_exposure_sol: 1.5   # столько SOL максимум в рынке одновременно
@@ -96,8 +96,9 @@ ops:
   health_host: "127.0.0.1"
   heartbeat_seconds: 300              # строка живости в лог
   shutdown_grace_seconds: 30          # сколько ждать токены в работе при остановке
-  max_grok_calls_per_day: 2000        # потолок расхода на агентов за сутки
+  max_grok_calls_per_day: 2000        # потолок, если включено вето
   grok_max_concurrency: 4             # одновременных запросов к Grok
   grok_calls_per_minute: 60           # ограничитель частоты
   breaker_failures: 8                 # столько сбоев подряд размыкают цепь
-  breaker_cooldown_seconds: 120       # и на столько пайплайн перестаёт звать Grok
+  breaker_cooldown_seconds: 120       # пауза вызовов; вход при этом механический
+  grok_entry_veto: false              # вход считает код; Grok — одно вето после прохода
