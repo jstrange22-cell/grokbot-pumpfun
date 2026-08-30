@@ -3,6 +3,25 @@
 Формат: что изменилось и почему это имело значение. Версии — по смыслу, а
 не по расписанию.
 
+## 0.4.4 — 2026-08-30
+
+- **Monitor still never promoted after 0.4.3.** `unique_buyers` stayed 0
+  because paid PumpPortal `subscribeTokenTrade` is off (it billed wallet
+  HA8 ~0.01 SOL every ~2 minutes) and v3 `/trades/all/{mint}` 404s without
+  a pump.fun site JWT. The public v3 coin card
+  (`GET /coins/{mint}`) returns `last_trade_timestamp`,
+  `real_sol_reserves`, `virtual_sol_reserves`, `market_cap` — not
+  `unique_buyers`. The 0.4.3 analyzer `no_trade_data` bypass never fired:
+  nothing reached Grok, `grok_tokens_in` stayed 0.
+  REST refresh now treats a card with `last_trade_timestamp` set **or**
+  `real_sol_reserves > 0.3 SOL` (lamports / 1e9) as traction and sets
+  `unique_buyers` to at least `min_unique_buyers`. A brand-new card with
+  no last trade and ~0 real SOL stays `few_buyers`. Paid
+  `subscribeTokenTrade` stays off; `data.api_key` is still not sent as
+  `Authorization`. Gates stay `min_unique_buyers=5`, `min_age_seconds=120`,
+  `max_sol_per_trade=0.05`, `max_open_positions=1`.
+  `daily_loss_limit_sol` is not restored to 0.1.
+
 ## 0.4.3 — 2026-08-30
 
 - **Analyzer skipped every promote as `no_trade_data`.** After 0.4.2 the

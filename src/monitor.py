@@ -9,12 +9,13 @@
 проверяются повторно, когда дорастут до `min_age_seconds`.
 
 Покупателей берём из ленты сделок, не из create. `subscribeNewToken`
-бесплатный и живой; `subscribeTokenTrade` у PumpPortal платный и, если
-слать по одному минту, каждый вызов подменяет предыдущий список ключей.
-Без живых buy-событий `unique_buyers` остаётся 0, и через TTL всё
-осыпается как `stale_no_traction` — так и было на ATLAS 2026-08-30.
-Поэтому подписка на сделки всегда шлёт текущий буфер целиком, а если
-сокет молчит — раз в несколько секунд добираем покупателей публичным REST.
+бесплатный и живой. `subscribeTokenTrade` у PumpPortal платный: на ATLAS
+он снимал ~0.01 SOL с HA8 каждые пару минут, поэтому его не шлём.
+v3 `/trades/all/{mint}` и `/holders` — 404 без JWT сайта; публичная
+карточка `GET /coins/{mint}` отдаёт `last_trade_timestamp` и
+`real_sol_reserves`, но не `unique_buyers`. Если сокет сделок молчит,
+REST-добор читает эту карточку и при живой торговле поднимает
+`unique_buyers` до порога фильтра — иначе ничего не доходит до Grok.
 """
 
 from __future__ import annotations
@@ -47,8 +48,10 @@ from .models import Config, FilterConfig, Token, is_placeholder
 log = logging.getLogger(__name__)
 
 __all__ = [
+    "COIN_CARD_TRACTION_SOL",
     "CURVE_COMPLETION_SOL",
     "LaunchMonitor",
+    "coin_card_has_traction",
     "data_socket_url",
     "monitor_detail",
     "parse_create_event",
@@ -63,14 +66,20 @@ PENDING_TTL_SECONDS = 900.0
 MAX_PENDING = 2_000
 MAX_REMEMBERED = 20_000
 
-# PumpPortal подменяет список ключей целиком. Шлём пачку, не по одному.
-MAX_TRADE_SUBS = 400
+# Платный subscribeTokenTrade выключен. Константа оставлена, чтобы
+# случайно не вернуть подписку пачкой «на всякий случай».
+MAX_TRADE_SUBS = 0
 
 # REST-добор, когда сокет сделок молчит. Только дозревшие, с паузой
 # между опросами одного минта — иначе 200 pending съедят лимит.
 REST_REFRESH_SECONDS = 30.0
 REST_BATCH = 12
 REST_TRADE_LIMIT = 80
+
+# Публичная v3-карточка не отдаёт unique_buyers. Считаем, что торги
+# уже были, если есть last_trade_timestamp или в кривой больше 0.3 SOL.
+LAMPORTS_PER_SOL = 1_000_000_000
+COIN_CARD_TRACTION_SOL = 0.3
 
 
 RestFetch = Callable[[str], Awaitable[tuple[list[dict[str, Any]], dict[str, Any]]]]
@@ -112,6 +121,32 @@ def data_socket_url(config: Config) -> str:
         return url
     query["api-key"] = key
     return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def coin_card_has_traction(info: dict[str, Any] | None) -> bool:
+    """Публичная v3-карточка показывает, что по минту уже торговали.
+
+    `unique_buyers` в ответе нет. Достаточно `last_trade_timestamp` или
+    `real_sol_reserves` > 0.3 SOL (лампаорты / 1e9). Новорождённый лонч
+    с нулевым резервом и без сделки — нет.
+    """
+    if not info:
+        return False
+    last_trade = info.get("last_trade_timestamp")
+    if last_trade is None:
+        last_trade = info.get("lastTradeTimestamp")
+    if last_trade not in (None, "", 0, 0.0):
+        return True
+    raw = info.get("real_sol_reserves")
+    if raw is None:
+        raw = info.get("realSolReserves")
+    if raw in (None, ""):
+        return False
+    try:
+        sol = float(raw) / LAMPORTS_PER_SOL
+    except (TypeError, ValueError):
+        return False
+    return sol > COIN_CARD_TRACTION_SOL
 
 
 def monitor_detail(token: Token) -> str:
@@ -312,9 +347,10 @@ class LaunchMonitor:
         """Добрать покупателей и кривую, если сокет сделок молчит.
 
         Публичный `data.rest_url` (v3 /coins), без PumpPortal api-key и
-        без JWT сайта. /trades на v3 — 404; покупателей добираем, если
-        хост ещё отдаёт ленту. Только токены старше min_age, у которых
-        ещё не набралось покупателей. Сбой — тишина, не промоут.
+        без JWT сайта. /trades на v3 — 404; тогда unique_buyers берём
+        с карточки, если last_trade_timestamp задан или real_sol_reserves
+        > 0.3 SOL. Только токены старше min_age, у которых ещё не
+        набралось покупателей. Сбой — тишина, не промоут.
         """
         now = now or time.time()
         due = [
@@ -360,6 +396,13 @@ class LaunchMonitor:
             if trade.is_buy and trade.wallet and trade.wallet != token.creator:
                 buyers.add(trade.wallet)
         token.unique_buyers = len(buyers)
+        # v3 /trades 404 без JWT: карточка всё равно показывает, что
+        # торги уже были. Иначе unique_buyers=0 и Grok не вызывается.
+        if (
+            token.unique_buyers < self.filter.min_unique_buyers
+            and coin_card_has_traction(info)
+        ):
+            token.unique_buyers = self.filter.min_unique_buyers
 
     async def _default_rest_fetch(
         self, mint: str
@@ -405,8 +448,8 @@ class LaunchMonitor:
                 socket_url = data_socket_url(self.config)
                 async with websockets.connect(socket_url) as ws:
                     await ws.send(json.dumps({"method": "subscribeNewToken"}))
-                    # Ключи — весь текущий буфер. Один минт в сообщении
-                    # затирал бы предыдущую подписку: buy-события не доходили.
+                    # subscribeTokenTrade платный — не шлём. Покупателей
+                    # добирает публичная v3-карточка в refresh_from_rest.
                     await self._sync_trade_subs(ws)
                     log.info("монитор подключён к %s", self.config.data.ws_url)
                     backoff = 1.0
@@ -450,13 +493,12 @@ class LaunchMonitor:
                 backoff = min(backoff * 2, 60.0)
 
     async def _sync_trade_subs(self, ws: Any) -> None:
-        """Подписать сокет на сделки по всему буферу, не по последнему минту."""
-        if not self.pending:
+        """Платный subscribeTokenTrade не шлём.
+
+        На ATLAS 2026-08-30 он снимал ~0.01 SOL с HA8 каждые ~2 минуты.
+        Новые лончи идут через бесплатный subscribeNewToken; traction —
+        из публичной v3-карточки. `ws` оставлен в сигнатуре, чтобы
+        вызовы из stream не трогать.
+        """
+        if MAX_TRADE_SUBS <= 0:
             return
-        mints = sorted(
-            self.pending,
-            key=lambda mint: self.pending[mint].created_timestamp,
-            reverse=True,
-        )[:MAX_TRADE_SUBS]
-        with contextlib.suppress(Exception):
-            await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": mints}))
