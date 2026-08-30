@@ -56,11 +56,11 @@ class Token(BaseModel):
 
     @property
     def has_metadata(self) -> bool:
-        # PumpPortal subscribeNewToken create events typically include
-        # name/symbol/uri and not a separate image field. The picture lives
-        # in the Metaplex JSON at `uri`. Requiring image_uri here skipped
-        # every live launch as no_metadata (163/163 on 2026-08-30).
-        return bool(self.name) and bool(self.image_uri or self.metadata_uri)
+        # TradeLog.skip пишет только mint/symbol/stage/reason — пустой
+        # symbol в JSONL значит, что parse не нашёл тикер, а не то, что
+        # на токене не было name/uri. После разбора и публичного
+        # дозапроса по mint достаточно имени или metadata_uri.
+        return bool(self.name) or bool(self.metadata_uri)
 
     @property
     def has_socials(self) -> bool:

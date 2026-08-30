@@ -22,6 +22,19 @@ def position() -> Position:
                     token_amount=100.0, opened_at=1.0, tx_hash="dry_run")
 
 
+def test_skip_does_not_record_name_or_uris(trade_log):
+    """В skip нет name/image_uri/metadata_uri — их отсутствие в файле
+    ничего не говорит о токене. Пустой symbol — говорит: parse его не нашёл."""
+    tok = Token(mint="M" * 12, name="Cat", symbol=None,
+                image_uri="https://i", metadata_uri="https://u")
+    record = trade_log.skip(tok, stage="monitor", reason="no_metadata")
+    assert record["symbol"] is None
+    assert "name" not in record
+    assert "image_uri" not in record
+    assert "metadata_uri" not in record
+    assert set(record) >= {"mint", "symbol", "stage", "reason", "detail", "scores"}
+
+
 def test_records_carry_mode_and_timestamp(trade_log):
     record = trade_log.skip(token(), stage="monitor", reason="few_buyers")
     assert record["mode"] == "dry-run"

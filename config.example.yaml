@@ -55,7 +55,7 @@ risk:
 filter:
   min_unique_buyers: 5          # минимум уникальных покупателей
   max_curve_progress: 0.40      # заполнение кривой меньше 40%
-  require_metadata: true        # есть имя и (картинка или uri метаданных)
+  require_metadata: true        # есть имя или uri метаданных
   min_age_seconds: 120          # возраст больше 2 минут
   max_risk_score: 7.0           # отсечка анализатора, 0..10
   min_total_score: 0.65         # минимальный скоринг для похода к чекеру

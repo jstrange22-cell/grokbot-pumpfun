@@ -40,11 +40,18 @@ def test_healthy_token_passes(cfg):
 
 
 def test_missing_metadata_rejected(cfg):
-    ok, reason = passes_filter(make_token(image_uri=None), cfg)
+    """Нет ни имени, ни metadata_uri — отказ. Картинка сама по себе не считается."""
+    ok, reason = passes_filter(make_token(name=None, image_uri=None, metadata_uri=None), cfg)
     assert not ok and reason == "no_metadata"
 
-    ok, reason = passes_filter(make_token(name=None), cfg)
-    assert not ok and reason == "no_metadata"
+
+def test_name_or_metadata_uri_counts(cfg):
+    ok, reason = passes_filter(make_token(image_uri=None), cfg)
+    assert ok and reason == "ok"
+    ok, reason = passes_filter(
+        make_token(name=None, image_uri=None, metadata_uri="https://ipfs.io/ipfs/x"), cfg
+    )
+    assert ok and reason == "ok"
 
 
 def test_metadata_ignored_when_not_required(cfg):
@@ -83,7 +90,7 @@ def test_curve_boundary(cfg):
 def test_terminal_reasons_win_over_temporary(cfg):
     """Порядок причин важен: безнадёжный токен не должен висеть в буфере
     как 'too_young' или 'few_buyers' — иначе он там до протухания."""
-    token = make_token(image_uri=None, created_timestamp=time.time())
+    token = make_token(name=None, image_uri=None, metadata_uri=None, created_timestamp=time.time())
     ok, reason = passes_filter(token, cfg)
     assert not ok and reason == "no_metadata"
 
@@ -132,8 +139,7 @@ def test_parse_create_event():
 
 
 def test_pumpportal_create_without_image_is_not_no_metadata(cfg):
-    """Прод 2026-08-30: 163/163 лончей отсеялись как no_metadata, потому что
-    PumpPortal шлёт name+symbol+uri и не кладёт отдельное поле image."""
+    """Плоская форма docs: name+symbol+uri, без image — не no_metadata."""
     token = parse_create_event(pumpportal_create())
     assert token is not None
     assert token.image_uri is None
@@ -166,6 +172,40 @@ def test_pumpportal_launches_are_not_all_skipped_as_no_metadata():
             promoted += 1
     assert promoted == 20
     assert skips == []
+
+
+def test_parse_maps_nested_and_aliased_identity_fields():
+    """Поля могут лежать в token/data и называться tokenSymbol / metadataUri."""
+    token = parse_create_event({
+        "txType": "create",
+        "mint": "NestedMint",
+        "token": {
+            "tokenName": "Nested Cat",
+            "tokenSymbol": "NCAT",
+            "metadataUri": "https://ipfs.io/ipfs/QmNested",
+        },
+    })
+    assert token is not None
+    assert token.name == "Nested Cat"
+    assert token.symbol == "NCAT"
+    assert token.metadata_uri == "https://ipfs.io/ipfs/QmNested"
+    assert token.has_metadata
+
+
+def test_mint_only_create_leaves_symbol_empty():
+    """Так выглядели skip JSONL: mint есть, symbol пустой — parse не нашёл тикер."""
+    token = parse_create_event({
+        "txType": "create",
+        "mint": "MintOnly",
+        "traderPublicKey": "Creator1",
+        "vSolInBondingCurve": 30.0,
+        "timestamp": (time.time() - 300) * 1000,
+    })
+    assert token is not None
+    assert token.symbol is None
+    assert token.name is None
+    assert token.metadata_uri is None
+    assert not token.has_metadata
 
 
 def test_fresh_launch_has_zero_progress():
@@ -397,14 +437,20 @@ async def test_stream_does_not_fetch_when_name_is_present(monkeypatch):
     """Обычный PumpPortal-лонч (есть name+uri) не ходит в сеть за JSON."""
     created = (time.time() - 300) * 1000
     called: list[str] = []
+    coins: list[str] = []
 
     async def fake_fetch(uri: str, request_timeout: float = 10.0, client=None):
         called.append(uri)
         return {}
 
+    async def fake_coin(mint: str, rest_url: str, request_timeout: float = 10.0, client=None):
+        coins.append(mint)
+        return {}
+
     import src.monitor as monitor_module
 
     monkeypatch.setattr(monitor_module, "fetch_offchain_metadata", fake_fetch)
+    monkeypatch.setattr(monitor_module, "fetch_public_coin", fake_coin)
 
     ws = FakeWebSocket([
         pumpportal_create("A", timestamp=created),
@@ -422,6 +468,7 @@ async def test_stream_does_not_fetch_when_name_is_present(monkeypatch):
     assert token.mint == "A"
     assert token.name == "Cat Coin"
     assert called == []
+    assert coins == []
 
 
 async def test_stream_enriches_nameless_create_from_uri(monkeypatch):
@@ -457,24 +504,64 @@ async def test_stream_enriches_nameless_create_from_uri(monkeypatch):
     assert seen_uris == ["https://ipfs.io/ipfs/QmOnlyUri"]
 
 
-async def test_nameless_create_stays_no_metadata_if_uri_fetch_fails(monkeypatch):
-    """Нет имени и JSON по uri не открылся — отказ, а не пропуск фильтра."""
+async def test_mint_only_create_is_enriched_from_public_coin(monkeypatch):
+    """Провод: только mint. Карточка /coins/{mint} без API-ключа даёт имя и uri."""
+    created = (time.time() - 300) * 1000
+    seen: list[tuple[str, str]] = []
+
+    async def fake_coin(mint: str, rest_url: str, request_timeout: float = 10.0, client=None):
+        seen.append((mint, rest_url))
+        return {
+            "name": "From REST",
+            "symbol": "RST",
+            "metadata_uri": "https://ipfs.io/ipfs/QmFromRest",
+            "image_uri": "https://img/rest.png",
+        }
+
+    async def fake_uri(uri: str, request_timeout: float = 10.0, client=None):
+        raise AssertionError("при name+uri с REST офчейн не нужен")
+
+    import src.monitor as monitor_module
+
+    monkeypatch.setattr(monitor_module, "fetch_public_coin", fake_coin)
+    monkeypatch.setattr(monitor_module, "fetch_offchain_metadata", fake_uri)
+
+    skips: list = []
+    mon = make_monitor(skips)
+    mon.config.data.api_key = "paid-key-must-not-be-used"
+    mon.handle_event({
+        "txType": "create", "mint": "A", "traderPublicKey": "creator",
+        "timestamp": created,
+    })
+    await mon.enrich_identity(mon.pending["A"])
+    out = None
+    for wallet in ("w1", "w2", "w3"):
+        out = mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": wallet})
+    assert out is not None
+    assert out.symbol == "RST"
+    assert out.name == "From REST"
+    assert out.has_metadata
+    assert skips == []
+    assert seen == [("A", mon.config.data.rest_url)]
+
+
+async def test_mint_only_stays_no_metadata_if_public_coin_fails(monkeypatch):
+    """Нет name/symbol/uri на проводе и карточка молчит — отказ, не пропуск фильтра."""
     created = (time.time() - 300) * 1000
 
-    async def fake_fetch(uri: str, request_timeout: float = 10.0, client=None):
+    async def fake_coin(mint: str, rest_url: str, request_timeout: float = 10.0, client=None):
         return {}
 
     import src.monitor as monitor_module
 
-    monkeypatch.setattr(monitor_module, "fetch_offchain_metadata", fake_fetch)
+    monkeypatch.setattr(monitor_module, "fetch_public_coin", fake_coin)
 
     skips: list = []
     mon = make_monitor(skips)
     mon.handle_event(
-        {"txType": "create", "mint": "A", "uri": "https://ipfs.io/ipfs/QmMissing",
-         "timestamp": created}
+        {"txType": "create", "mint": "A", "timestamp": created}
     )
-    await mon.enrich_from_uri(mon.pending["A"])
+    await mon.enrich_identity(mon.pending["A"])
     for wallet in ("w1", "w2", "w3"):
         mon.handle_event({"txType": "buy", "mint": "A", "traderPublicKey": wallet})
     assert skips == [("A", "no_metadata")]

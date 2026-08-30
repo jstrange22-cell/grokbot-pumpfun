@@ -177,6 +177,32 @@ def apply_offchain_metadata(token: Token, info: dict[str, Any]) -> Token:
     return token
 
 
+async def fetch_public_coin(
+    mint: str,
+    rest_url: str,
+    request_timeout: float = 10.0,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """GET /coins/{mint} на публичном frontend-api. Без Authorization."""
+    url = f"{rest_url.rstrip('/')}/coins/{mint}"
+    owns_client = client is None
+    http = client or httpx.AsyncClient(
+        timeout=request_timeout,
+        headers={"Accept": "application/json"},
+    )
+    try:
+        resp = await http.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        log.warning("публичная карточка %s не прочиталась: %s", mint[:8], exc)
+        return {}
+    finally:
+        if owns_client:
+            await http.aclose()
+
+
 async def fetch_offchain_metadata(
     uri: str,
     request_timeout: float = 10.0,
@@ -207,6 +233,7 @@ def enrich_token(token: Token, info: dict[str, Any]) -> Token:
     token.symbol = token.symbol or info.get("symbol")
     token.description = token.description or info.get("description")
     token.image_uri = token.image_uri or info.get("image_uri") or info.get("image")
+    token.metadata_uri = token.metadata_uri or info.get("metadata_uri") or info.get("uri")
     token.twitter = token.twitter or info.get("twitter")
     token.telegram = token.telegram or info.get("telegram")
     token.website = token.website or info.get("website")

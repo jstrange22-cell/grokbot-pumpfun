@@ -14,6 +14,7 @@ from src.analyzer import (
     compute_metrics,
     enrich_token,
     fetch_offchain_metadata,
+    fetch_public_coin,
     parse_holder,
     parse_trade,
     resolve_metadata_url,
@@ -120,6 +121,18 @@ def test_enrich_fills_only_missing_fields():
     assert tok.sol_in_curve == 30.0
 
 
+def test_enrich_maps_metadata_uri_from_coin_card():
+    tok = token(name=None, symbol=None, image_uri=None)
+    enrich_token(tok, {
+        "name": "Coin",
+        "symbol": "COIN",
+        "metadata_uri": "https://ipfs.io/ipfs/QmCard",
+        "image_uri": "https://i/card.png",
+    })
+    assert tok.metadata_uri == "https://ipfs.io/ipfs/QmCard"
+    assert tok.has_metadata
+
+
 def test_resolve_ipfs_uri():
     assert resolve_metadata_url("ipfs://QmCid/meta.json") == "https://ipfs.io/ipfs/QmCid/meta.json"
     assert resolve_metadata_url("https://arweave.net/x") == "https://arweave.net/x"
@@ -154,6 +167,25 @@ async def test_fetch_offchain_metadata_has_no_api_key():
     )
     assert data["name"] == "Offchain"
     assert seen == [""]
+
+
+async def test_fetch_public_coin_has_no_authorization():
+    """Даже с data.api_key в конфиге монитор не шлёт Bearer на /coins/{mint}."""
+    seen_auth: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers.get("authorization", ""))
+        assert request.url.path == "/coins/Mint1"
+        return httpx.Response(200, json={"name": "Public", "symbol": "PUB",
+                                         "metadata_uri": "https://ipfs.io/ipfs/x"})
+
+    data = await fetch_public_coin(
+        "Mint1",
+        rest_url="https://frontend-api.pump.fun",
+        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+    assert data["symbol"] == "PUB"
+    assert seen_auth == [""]
 
 
 # --- метрики --------------------------------------------------------------

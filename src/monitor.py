@@ -22,7 +22,12 @@ from typing import Any
 
 import websockets
 
-from .analyzer import apply_offchain_metadata, fetch_offchain_metadata
+from .analyzer import (
+    apply_offchain_metadata,
+    enrich_token,
+    fetch_offchain_metadata,
+    fetch_public_coin,
+)
 from .curve import CURVE_COMPLETION_SOL, progress_from_sol
 from .models import Config, FilterConfig, Token
 
@@ -59,16 +64,47 @@ class SeenSet:
         return len(self._items)
 
 
+_NEST_KEYS = ("token", "data", "result", "message", "coin")
+
+
+def _event_layers(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Top-level плюс вложенные объекты — у PumpPortal поля иногда внутри."""
+    layers = [payload]
+    for key in _NEST_KEYS:
+        inner = payload.get(key)
+        if isinstance(inner, dict):
+            layers.append(inner)
+    return layers
+
+
+def _pick(layers: list[dict[str, Any]], *keys: str) -> Any:
+    for layer in layers:
+        for key in keys:
+            value = layer.get(key)
+            if isinstance(value, str) and not value.strip():
+                continue
+            if value not in (None, ""):
+                return value
+    return None
+
+
 def parse_create_event(payload: dict[str, Any]) -> Token | None:
-    """Событие создания токена -> Token. None, если событие не про создание."""
-    if payload.get("txType") not in ("create", "created"):
+    """Событие создания токена -> Token. None, если событие не про создание.
+
+    Ищет name/symbol/uri и на верхнем уровне, и во вложенных token/data/
+    result/message/coin, плюс алиасы (tokenSymbol, metadataUri, ticker).
+    Пустой symbol в skip JSONL как раз значит, что top-level `symbol`
+    не пришёл — без этого разбора тикер так и останется None.
+    """
+    layers = _event_layers(payload)
+    if _pick(layers, "txType", "tx_type") not in ("create", "created"):
         return None
-    mint = payload.get("mint") or payload.get("mintAddress")
+    mint = _pick(layers, "mint", "mintAddress", "tokenMint")
     if not mint:
         return None
 
-    sol_in_curve = float(payload.get("vSolInBondingCurve") or 0.0)
-    created = payload.get("timestamp") or payload.get("createdTimestamp")
+    sol_in_curve = float(_pick(layers, "vSolInBondingCurve") or 0.0)
+    created = _pick(layers, "timestamp", "createdTimestamp")
     created_ts = (
         float(created) / 1000.0
         if created and float(created) > 1e11
@@ -76,19 +112,19 @@ def parse_create_event(payload: dict[str, Any]) -> Token | None:
     )
 
     return Token(
-        mint=mint,
-        name=payload.get("name"),
-        symbol=payload.get("symbol"),
-        description=payload.get("description"),
-        image_uri=payload.get("image") or payload.get("image_uri"),
-        metadata_uri=payload.get("uri") or payload.get("metadata_uri"),
-        twitter=payload.get("twitter"),
-        telegram=payload.get("telegram"),
-        website=payload.get("website"),
-        creator=payload.get("traderPublicKey") or payload.get("creator"),
+        mint=str(mint),
+        name=_pick(layers, "name", "tokenName", "token_name"),
+        symbol=_pick(layers, "symbol", "tokenSymbol", "token_symbol", "ticker"),
+        description=_pick(layers, "description"),
+        image_uri=_pick(layers, "image", "image_uri", "imageUri"),
+        metadata_uri=_pick(layers, "uri", "metadata_uri", "metadataUri", "tokenUri"),
+        twitter=_pick(layers, "twitter"),
+        telegram=_pick(layers, "telegram"),
+        website=_pick(layers, "website"),
+        creator=_pick(layers, "traderPublicKey", "creator"),
         created_timestamp=created_ts,
         sol_in_curve=sol_in_curve,
-        market_cap_sol=float(payload.get("marketCapSol") or 0.0),
+        market_cap_sol=float(_pick(layers, "marketCapSol") or 0.0),
         # Резерв, который отдаёт сокет, включает 30 виртуальных SOL: они
         # лежат в кривой с рождения и прогрессом не являются.
         curve_progress=progress_from_sol(sol_in_curve),
@@ -133,7 +169,8 @@ class LaunchMonitor:
 
     def handle_event(self, payload: dict[str, Any]) -> Token | None:
         """Одно сообщение из сокета. Возвращает токен, если он готов идти дальше."""
-        tx_type = payload.get("txType")
+        layers = _event_layers(payload)
+        tx_type = _pick(layers, "txType", "tx_type")
 
         if tx_type in ("create", "created"):
             token = parse_create_event(payload)
@@ -145,7 +182,7 @@ class LaunchMonitor:
                 self._buyers[token.mint] = set()
             return None
 
-        mint = payload.get("mint")
+        mint = _pick(layers, "mint", "mintAddress")
         if not mint or mint not in self.pending:
             return None
 
@@ -164,20 +201,28 @@ class LaunchMonitor:
 
         return self._promote(token)
 
-    async def enrich_from_uri(self, token: Token) -> Token:
-        """Если сокет не дал имя, взять его из JSON по `uri`.
+    async def enrich_identity(self, token: Token) -> Token:
+        """Дописать имя/тикер/uri, если сокет принёс только mint.
 
-        Без data.api_key: это публичный Metaplex-файл (часто IPFS), не
-        платный REST провайдера. Падаем мягко — без имени фильтр всё
-        равно отсечёт как no_metadata.
+        Пустой symbol в skip JSONL — признак, что на проводе не было
+        top-level symbol. Сначала публичный GET /coins/{mint} без
+        data.api_key (frontend-api.pump.fun), потом JSON по uri.
+        Падаем мягко: без name и без metadata_uri фильтр скажет no_metadata.
         """
-        if token.name or not token.metadata_uri:
-            return token
-        info = await fetch_offchain_metadata(
-            token.metadata_uri,
-            request_timeout=self.config.data.request_timeout,
-        )
-        return apply_offchain_metadata(token, info)
+        if not token.name and not token.symbol and not token.metadata_uri:
+            info = await fetch_public_coin(
+                token.mint,
+                rest_url=self.config.data.rest_url,
+                request_timeout=self.config.data.request_timeout,
+            )
+            enrich_token(token, info)
+        if not token.name and token.metadata_uri:
+            meta = await fetch_offchain_metadata(
+                token.metadata_uri,
+                request_timeout=self.config.data.request_timeout,
+            )
+            apply_offchain_metadata(token, meta)
+        return token
 
     def _promote(self, token: Token) -> Token | None:
         """Проверить дозревший токен и вынуть его из буфера, если решение принято."""
@@ -253,11 +298,13 @@ class LaunchMonitor:
                                 if token is not None:
                                     await self._subscribe_trades(ws, token.mint, off=True)
                                     yield token
-                                elif payload.get("txType") in ("create", "created"):
-                                    mint = payload.get("mint") or payload.get("mintAddress")
+                                elif _pick(_event_layers(payload), "txType", "tx_type") in (
+                                    "create", "created",
+                                ):
+                                    mint = _pick(_event_layers(payload), "mint", "mintAddress")
                                     pending = self.pending.get(mint) if mint else None
                                     if pending is not None:
-                                        await self.enrich_from_uri(pending)
+                                        await self.enrich_identity(pending)
                                     if mint:
                                         await self._subscribe_trades(ws, mint)
                         if time.time() - last_sweep >= sweeper_delay:
