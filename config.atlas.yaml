@@ -61,8 +61,9 @@ risk:
 
 filter:
   # 5 buyers / 120s / curve < 40% stay. Do not loosen here.
-  # Buyer counts come from subscribeTokenTrade (whole pending buffer)
-  # plus REST fallback — not from create events.
+  # Paid subscribeTokenTrade is off. Buyers come from the public v3
+  # /coins/{mint} card (last_trade_timestamp / real_sol_reserves),
+  # not from create events and not from a PumpPortal data key.
   min_unique_buyers: 5
   max_curve_progress: 0.40
   require_metadata: true   # name + (image or metadata uri); image not required

@@ -216,9 +216,13 @@ xAI, нет ли 429. Цепь замкнётся сама после кулда
 ### Monitor never promotes (all `stale_no_traction`)
 
 If `trades.jsonl` is only `type=skip stage=monitor reason=stale_no_traction`
-and `detail` shows `buyers=0`, the trade tape is not landing. After 0.4.2
-the monitor resubscribes the whole pending buffer and REST-fills buyers
-for age-ready tokens. Gates are unchanged (5 buyers, 120s, curve under 40%).
+and `detail` shows `buyers=0`, the trade tape is not landing. Paid
+PumpPortal `subscribeTokenTrade` stays **off** (it billed HA8). v3
+`/trades` 404s without a site JWT. After 0.4.4 the monitor REST-fills
+`unique_buyers` from the public v3 coin card when `last_trade_timestamp`
+is set or `real_sol_reserves > 0.3 SOL`. A brand-new card with no last
+trade and ~0 real SOL stays `few_buyers`. Gates are unchanged (5 buyers,
+120s, curve under 40%).
 
 **How to tell the fix worked** (dry-run, no wallet):
 
@@ -240,6 +244,9 @@ stay `dry-run`. `curve_too_full` skips are expected for bonding-curve
 graduates — those are not the bug.
 
 ### Analyzer skips every promote as `no_trade_data` (0.4.3)
+
+If the monitor never promotes (`buyers=0`), that is the 0.4.4 coin-card
+path — this section is only after `unique_buyers` is already 5+.
 
 Promotes are landing (monitor `unique_buyers` 5+) but analyzer writes
 `stage=analyzer reason=no_trade_data` and `grok_tokens_in` stays 0.

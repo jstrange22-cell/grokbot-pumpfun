@@ -5,10 +5,18 @@ import asyncio
 import json
 import time
 
+import httpx
 import pytest
 
 from src.models import Config, FilterConfig, Token
-from src.monitor import CURVE_COMPLETION_SOL, LaunchMonitor, parse_create_event, passes_filter
+from src.monitor import (
+    COIN_CARD_TRACTION_SOL,
+    CURVE_COMPLETION_SOL,
+    LaunchMonitor,
+    coin_card_has_traction,
+    parse_create_event,
+    passes_filter,
+)
 
 
 @pytest.fixture
@@ -367,10 +375,7 @@ async def test_stream_yields_matured_token(monkeypatch):
     assert token.mint == "A"
     methods = [m["method"] for m in ws.sent]
     assert methods[0] == "subscribeNewToken"
-    trade_subs = [m for m in ws.sent if m.get("method") == "subscribeTokenTrade"]
-    assert trade_subs
-    assert "A" in trade_subs[-1]["keys"]          # буфер целиком, не один минт
-    assert "unsubscribeTokenTrade" not in methods  # отписка по одному затирала бы ленту
+    assert "subscribeTokenTrade" not in methods    # платный фид выключен
 
 
 async def test_stream_reconnects_after_drop(monkeypatch):
@@ -531,9 +536,8 @@ def test_monitor_detail_names_buyers_age_curve():
     assert "curve=0.120" in detail
 
 
-async def test_trade_subscribe_sends_whole_pending_buffer():
-    """Один subscribeTokenTrade с одним минтом затирает предыдущий список.
-    На живой ленте это оставляло unique_buyers=0 у всего буфера."""
+async def test_trade_subscribe_is_not_sent():
+    """Платный subscribeTokenTrade на ATLAS снимал 0.01 SOL / ~2 мин. Не шлём."""
     skips: list = []
     mon = make_monitor(skips)
     created = (time.time() - 300) * 1000
@@ -547,8 +551,7 @@ async def test_trade_subscribe_sends_whole_pending_buffer():
             sent.append(json.loads(raw))
 
     await mon._sync_trade_subs(Recorder())
-    assert sent[0]["method"] == "subscribeTokenTrade"
-    assert set(sent[0]["keys"]) == {"Old", "New"}
+    assert sent == []
 
 
 def test_buy_alias_fields_count_and_exclude_creator():
@@ -628,3 +631,141 @@ def test_atlas_filter_promotes_pumpportal_create_without_image():
     assert out.unique_buyers == 5
     assert out.image_uri is None
     assert out.has_metadata
+
+
+def test_coin_card_has_traction_from_last_trade_or_real_sol():
+    assert coin_card_has_traction({
+        "last_trade_timestamp": 1_756_560_000,
+        "real_sol_reserves": 0,
+    })
+    assert coin_card_has_traction({
+        "real_sol_reserves": 350_000_000,  # 0.35 SOL
+    })
+    # ровно 0.3 SOL — ещё не traction
+    assert not coin_card_has_traction({
+        "real_sol_reserves": int(COIN_CARD_TRACTION_SOL * 1_000_000_000),
+    })
+    assert not coin_card_has_traction({
+        "last_trade_timestamp": None,
+        "real_sol_reserves": 0,
+        "virtual_sol_reserves": 30_000_000_000,
+    })
+    assert not coin_card_has_traction({})
+    assert not coin_card_has_traction(None)
+
+
+def _atlas_monitor(skips: list, rest_fetch=None) -> LaunchMonitor:
+    config = Config()
+    config.data.api_key = "pp-must-not-appear"
+    config.data.rest_url = "https://frontend-api-v3.pump.fun"
+    config.filter = FilterConfig(
+        min_unique_buyers=5,
+        min_age_seconds=120.0,
+        require_metadata=True,
+        max_curve_progress=0.40,
+    )
+    return LaunchMonitor(
+        config,
+        on_skip=lambda t, r: skips.append((t.mint, r)),
+        rest_fetch=rest_fetch,
+    )
+
+
+async def test_trades_404_coin_card_with_last_trade_promotes(monkeypatch):
+    """v3 /trades 404 без JWT. Карточка с last_trade — достаточно для промоута."""
+    seen_auth: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_auth.append(request.headers.get("authorization", ""))
+        if "/trades/all/" in request.url.path:
+            return httpx.Response(404, json={"error": "no jwt"})
+        if "/coins/" in request.url.path:
+            return httpx.Response(200, json={
+                "name": "Cat Coin",
+                "symbol": "CAT",
+                "last_trade_timestamp": 1_756_560_000,
+                "real_sol_reserves": 400_000_000,
+                "virtual_sol_reserves": 30_400_000_000,
+                "market_cap": 12.0,
+                "reply_count": 3,
+            })
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+
+    class PatchedClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("src.monitor.httpx.AsyncClient", PatchedClient)
+
+    skips: list = []
+    mon = _atlas_monitor(skips)
+    mon.handle_event(pumpportal_create("A", timestamp=(time.time() - 180) * 1000))
+    assert mon.pending["A"].unique_buyers == 0
+
+    await mon.refresh_from_rest()
+    ready = mon.sweep()
+    assert [t.mint for t in ready] == ["A"]
+    assert ready[0].unique_buyers == 5
+    assert skips == []
+    assert seen_auth
+    assert all(value == "" for value in seen_auth)
+
+
+async def test_coin_card_real_sol_alone_promotes_when_trades_empty():
+    skips: list = []
+
+    async def fake_rest(mint: str):
+        return [], {
+            "real_sol_reserves": 350_000_000,
+            "virtual_sol_reserves": 30_350_000_000,
+            "market_cap": 11.0,
+        }
+
+    mon = _atlas_monitor(skips, rest_fetch=fake_rest)
+    mon.handle_event(pumpportal_create("A", timestamp=(time.time() - 180) * 1000))
+    await mon.refresh_from_rest()
+    ready = mon.sweep()
+    assert [t.mint for t in ready] == ["A"]
+    assert ready[0].unique_buyers == 5
+    assert skips == []
+
+
+async def test_brand_new_coin_card_stays_few_buyers(monkeypatch):
+    """Нет last_trade и ~0 real SOL — newborn, unique_buyers не поднимаем."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "/trades/all/" in request.url.path:
+            return httpx.Response(404)
+        if "/coins/" in request.url.path:
+            return httpx.Response(200, json={
+                "name": "Newborn",
+                "symbol": "NEW",
+                "last_trade_timestamp": None,
+                "real_sol_reserves": 0,
+                "virtual_sol_reserves": 30_000_000_000,
+                "market_cap": 4.0,
+                "reply_count": 0,
+            })
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(handler)
+
+    class PatchedClient(httpx.AsyncClient):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = transport
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr("src.monitor.httpx.AsyncClient", PatchedClient)
+
+    skips: list = []
+    mon = _atlas_monitor(skips)
+    mon.handle_event(pumpportal_create("A", timestamp=(time.time() - 180) * 1000))
+    await mon.refresh_from_rest()
+    assert mon.pending["A"].unique_buyers == 0
+    assert mon.sweep() == []
+    ok, reason = passes_filter(mon.pending["A"], mon.filter)
+    assert not ok and reason == "few_buyers"
+    assert skips == []
