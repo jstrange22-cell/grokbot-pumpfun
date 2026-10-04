@@ -148,7 +148,7 @@ async def test_dry_run_buys_and_logs_full_context(config):
     analysis = await pipeline.process(fresh_token())
 
     assert analysis is not None
-    assert analysis.checker.approve
+    assert analysis.checker is None
     assert pipeline.risk.open_count == 1
 
     records = list(read_log(config.logging.path))
@@ -158,13 +158,16 @@ async def test_dry_run_buys_and_logs_full_context(config):
     assert buy["tx_hash"] == "dry_run"          # ни одной реальной транзакции
     assert buy["mode"] == "dry-run"
     assert buy["scores"]["total"] >= config.filter.min_total_score
-    assert buy["audit"]["organic_buyer_share"] == 0.95
-    assert buy["narrative"] and buy["timing"] and buy["checker"]
+    assert buy["audit"] is None                 # вход механический, Grok выключен
+    assert buy["checker"] is None
+    assert buy["prompt_versions"]["entry"] == "mechanical"
     assert buy["metrics"]["trade_count"] == 30
     assert buy["entry_price"] > 0
+    assert pipeline.grok_ops.budget.spent == 0
 
 
 async def test_checker_veto_stops_the_buy(config):
+    config.ops.grok_entry_veto = True
     pipeline = Pipeline(config)
     wire(pipeline, REJECT)
     assert await pipeline.process(fresh_token()) is None
@@ -174,6 +177,7 @@ async def test_checker_veto_stops_the_buy(config):
     assert [r["type"] for r in records] == ["skip"]
     assert records[0]["stage"] == "checker"
     assert "contradiction" in records[0]["detail"]
+    assert pipeline.grok_ops.budget.spent == 1
 
 
 async def test_risk_gate_stops_the_buy(config):
@@ -241,12 +245,13 @@ async def test_restart_picks_up_open_position(config):
 
 
 async def test_restart_continues_grok_budget(config):
-    """Иначе петля рестартов выест дневной бюджет вызовов за час."""
+    """Вето тратит один вызов; рестарт не обнуляет счётчик."""
+    config.ops.grok_entry_veto = True
     first = Pipeline(config)
     wire(first, APPROVE)
     await first.process(fresh_token())
     spent = first.grok_ops.budget.spent
-    assert spent >= 4                      # аудитор, нарратив, тайминг, чекер
+    assert spent == 1
     await first.shutdown()
 
     second = Pipeline(config)
@@ -347,6 +352,7 @@ def test_monitor_promote_log_line(config):
 
 
 async def test_metrics_count_stages(config):
+    config.ops.grok_entry_veto = True
     pipeline = Pipeline(config)
     wire(pipeline, REJECT)
     await pipeline.process(fresh_token())
@@ -649,7 +655,7 @@ async def test_breaker_announced_once_per_transition(config):
     pipeline.grok_ops.breaker.record_success()
     pipeline._check_transitions()
     await flush_alerts(pipeline)
-    assert [e["text"] for e in seen if e["event"] == "breaker"][-1].endswith("продолжается")
+    assert "вето снова доступно" in [e["text"] for e in seen if e["event"] == "breaker"][-1]
 
 
 async def test_halt_is_announced(config):
@@ -827,37 +833,12 @@ async def test_entry_price_includes_slippage(config):
 # --- данные для агента-тайминга -------------------------------------------
 
 
-async def test_timing_agent_gets_measured_data(config):
-    """Агент рынка должен видеть наблюдения, а не внутренние счётчики."""
-    captured: list[dict] = []
-
-    def grok_handler_capturing(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        system = body["messages"][0]["content"]
-        if "рыночного режима" in system:
-            captured.append(json.loads(body["messages"][1]["content"]))
-            return httpx.Response(200, json={"choices": [{"message": {"content": GOOD_TIMING}}]})
-        content = {"форензик": GOOD_AUDIT, "мем-культуры": GOOD_NARRATIVE,
-                   "риск-офицер": APPROVE}
-        for marker, answer in content.items():
-            if marker in system:
-                return httpx.Response(200, json={"choices": [{"message": {"content": answer}}]})
-        raise AssertionError("неизвестный агент")
-
+async def test_timing_snapshot_is_measured_not_invented(config):
+    """Пульс рынка — свои наблюдения, не выдуманные котировки."""
     pipeline = Pipeline(config)
-    grok = httpx.AsyncClient(transport=httpx.MockTransport(grok_handler_capturing))
-    for agent in (pipeline.auditor, pipeline.narrative, pipeline.timing, pipeline.checker):
-        agent._client = grok
-    data = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(data_handler))
-    pipeline.analyzer._client = data
-    pipeline.executor._client = data
-
     for index in range(10):
         pipeline.pulse.record_launch(35.0 + index)
-    await pipeline.process(fresh_token())
-
-    assert captured, "тайминг-агента не спросили"
-    наблюдения = captured[0]["наблюдения"]
+    наблюдения = pipeline._market_snapshot()
     assert наблюдения["лончей_в_окне"] >= 10
     assert наблюдения["медиана_sol_в_кривой"] > 30
     assert "час_utc" in наблюдения
@@ -998,26 +979,25 @@ def test_unmatched_intents_pairs_records():
 
 
 async def test_buy_records_prompt_versions(config):
-    """Правка промпта меняет поведение агента, а записи выглядят одинаково.
-    Без пометки подбор весов по логу сравнивает двух разных ботов."""
+    """Механический вход помечается в логе; вето добавляет версию чекера."""
     pipeline = Pipeline(config)
     wire(pipeline, APPROVE)
     await pipeline.process(fresh_token())
 
     buy = next(r for r in read_log(config.logging.path) if r["type"] == "buy")
-    versions = buy["prompt_versions"]
-    assert set(versions) == {"auditor", "narrative", "timing", "checker"}
-    assert all(value for value in versions.values())
+    assert buy["prompt_versions"] == {"entry": "mechanical"}
 
 
 def test_prompt_versions_are_distinct(config):
+    config.ops.grok_entry_veto = True
     versions = Pipeline(config).prompt_versions()
+    assert versions["entry"] == "mechanical"
+    assert versions["checker"]
     assert len(set(versions.values())) == len(versions)
 
 
 async def test_plan_is_computed_before_the_checker(config):
-    """Риск-гейт считается дважды: до чекера — чтобы он видел экономику,
-    после — потому что за время его раздумий лимиты могли измениться."""
+    """Риск-гейт считает размер до исполнения: лог и позиция сходятся."""
     pipeline = Pipeline(config)
     wire(pipeline, APPROVE)
     analysis = await pipeline.process(fresh_token())
@@ -1110,3 +1090,103 @@ async def test_cooldown_blocks_new_buys(config):
     records = list(read_log(config.logging.path))
     assert records[-1]["reason"].startswith("cooldown_after_losses")
     assert pipeline.status()["losing_streak"] == 1
+
+
+# --- механический вход / бюджет Grok --------------------------------------
+
+
+def empty_tape_handler(request: httpx.Request) -> httpx.Response:
+    """v3: /trades и /holders 404, карточка /coins живая."""
+    path = request.url.path
+    if path.endswith("/holders") or "/trades/all/" in path:
+        return httpx.Response(404, json={"error": "no jwt"})
+    return httpx.Response(200, json={
+        "description": "милейший кот интернета",
+        "twitter": "https://x.com/cat", "telegram": "https://t.me/cat",
+        "website": "https://cat.fun",
+        "virtual_sol_reserves": CURVE["sol"],
+        "virtual_token_reserves": CURVE["tokens"],
+        "last_trade_timestamp": 1_756_560_000,
+        "market_cap": 30.0,
+    })
+
+
+def counting_grok(seen: list):
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content)["messages"][0]["content"][:40])
+        raise AssertionError(f"Grok вызван зря: {seen[-1]}")
+    return handler
+
+
+def wire_empty_tape(pipeline: Pipeline, grok_handler=None) -> None:
+    grok = httpx.AsyncClient(transport=httpx.MockTransport(
+        grok_handler or counting_grok([])
+    ))
+    for agent in (pipeline.auditor, pipeline.narrative, pipeline.timing, pipeline.checker):
+        agent._client = grok
+    data = httpx.AsyncClient(
+        base_url="http://test", transport=httpx.MockTransport(empty_tape_handler),
+    )
+    pipeline.analyzer._client = data
+    pipeline.executor._client = data
+
+
+async def test_empty_tape_does_not_spend_four_grok_calls(config):
+    """404 /trades+/holders: ни одного вызова xAI, даже при живых WS."""
+    seen: list = []
+    pipeline = Pipeline(config)
+    wire_empty_tape(pipeline, counting_grok(seen))
+    token = fresh_token()
+    token.ws_buyers = 12
+    token.unique_buyers = 12
+    analysis = await pipeline.process(token)
+    assert analysis is not None
+    assert pipeline.risk.open_count == 1
+    assert seen == []
+    assert pipeline.grok_ops.budget.spent == 0
+
+
+async def test_inferred_card_buyers_do_not_call_grok(config):
+    """Карточка last_trade → unique_buyers=5 не должна слать 4 агента."""
+    seen: list = []
+    pipeline = Pipeline(config)
+    wire_empty_tape(pipeline, counting_grok(seen))
+    token = fresh_token()
+    token.unique_buyers = 5
+    token.ws_buyers = 0
+    token.buyers_inferred = True
+    await pipeline.process(token)
+    assert seen == []
+    assert pipeline.grok_ops.budget.spent == 0
+
+
+async def test_exhausted_grok_budget_still_buys(config):
+    """Исчерпанный бюджет не стопорит книгу: механический клип проходит."""
+    config.ops.grok_entry_veto = True
+    config.ops.max_grok_calls_per_day = 1
+    seen: list = []
+    pipeline = Pipeline(config)
+    pipeline.grok_ops.budget.spent = 1
+    pipeline.risk.grok_calls_today = 1
+    wire_empty_tape(pipeline, counting_grok(seen))
+    token = fresh_token()
+    token.ws_buyers = 12
+    token.unique_buyers = 12
+    analysis = await pipeline.process(token)
+    assert analysis is not None
+    assert pipeline.risk.open_count == 1
+    assert seen == []
+    assert pipeline.grok_ops.budget.spent == 1
+
+
+async def test_default_entry_is_grok_off(config):
+    assert config.ops.grok_entry_veto is False
+    pipeline = Pipeline(config)
+    wire(pipeline, APPROVE)
+    pipeline.checker._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda r: (_ for _ in ()).throw(AssertionError("чекер вызван при veto off"))
+        )
+    )
+    assert await pipeline.process(fresh_token()) is not None
+    assert pipeline.grok_ops.budget.spent == 0

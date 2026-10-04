@@ -190,7 +190,7 @@ class Analyzer:
     async def inspect(
         self, token: Token,
     ) -> tuple[list[Holder], list[Trade], CurveState | None, TokenMetrics]:
-        """То, что пайплайну нужно до агентов: сырьё, кривая, метрики."""
+        """То, что пайплайну нужно до скоринга: сырьё, кривая, метрики."""
         _info, holders, trades, curve = await self.gather(token)
         metrics = compute_metrics(
             token, holders, trades, curve, self.config.market,

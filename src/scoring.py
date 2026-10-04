@@ -1,9 +1,11 @@
 """Скоринг-матрица. Код, без LLM.
 
-Сводит четыре компонента — аудит, нарратив, тайминг, метрики — в одно
-число 0..1 с весами из конфига. Это дешёвый гейт перед дорогим чекером:
-всё, что не дотянуло до `filter.min_total_score`, логируется как skip с
-разбивкой по компонентам и до grok-4 не доходит.
+Вход считает `compute_mechanical_scores`: покупатели, кривая, публичная
+карточка /coins. Grok в эту сумму не входит.
+
+`compute_scores` остаётся для разбора лога и для опционального вето:
+четыре компонента (аудит, нарратив, тайминг, метрики) с весами из конфига.
+Отсутствующий агент даёт ноль — сбой не должен поднимать итог.
 
 Веса из конфига нормализуются: если пользователь напишет 0.5/0.5/0.5/0.5,
 итог всё равно останется в диапазоне 0..1, а пропорции сохранятся.
@@ -30,6 +32,49 @@ def normalized_weights(weights: ScoringWeights) -> dict[str, float]:
         # Вырожденный конфиг: равные веса лучше деления на ноль.
         return dict.fromkeys(raw, 0.25)
     return {key: value / total for key, value in raw.items()}
+
+
+# Механический вход: метрики, живые покупатели, кривая. Без Grok.
+MECHANICAL_METRICS = 0.45
+MECHANICAL_TRACTION = 0.30
+MECHANICAL_CURVE = 0.25
+# Карточка last_trade без посчитанных кошельков слабее ленты.
+INFERRED_TRACTION_HAIRCUT = 0.50
+
+
+def compute_mechanical_scores(analysis: Analysis, config: Config) -> Scores:
+    """Скоринг входа: WS/лента, кривая, публичная карточка. Grok не зовём."""
+    token = analysis.token
+    metrics = analysis.metrics
+    min_buyers = max(1, config.filter.min_unique_buyers)
+    inferred = token.buyers_inferred and token.ws_buyers <= 0
+    if inferred:
+        buyers = token.unique_buyers
+        traction = _clamp(buyers / (min_buyers * 2)) * INFERRED_TRACTION_HAIRCUT
+    else:
+        buyers = token.ws_buyers or metrics.unique_wallets or token.unique_buyers
+        traction = _clamp(buyers / (min_buyers * 2))
+
+    min_liq = max(config.market.min_curve_liquidity_sol, 1e-9)
+    liq_score = _clamp(metrics.curve_liquidity_sol / (min_liq * 2))
+    if metrics.curve_health > 0:
+        curve = _clamp(0.5 * liq_score + 0.5 * metrics.curve_health)
+    else:
+        curve = liq_score
+
+    quality = metrics.quality
+    total = (
+        MECHANICAL_METRICS * quality
+        + MECHANICAL_TRACTION * traction
+        + MECHANICAL_CURVE * curve
+    )
+    return Scores(
+        audit=round(traction, 4),
+        narrative=round(metrics.social_signals, 4),
+        timing=round(curve, 4),
+        metrics=round(_clamp(quality), 4),
+        total=round(_clamp(total), 4),
+    )
 
 
 def compute_scores(analysis: Analysis, config: Config) -> Scores:

@@ -709,6 +709,8 @@ async def test_trades_404_coin_card_with_last_trade_promotes(monkeypatch):
     ready = mon.sweep()
     assert [t.mint for t in ready] == ["A"]
     assert ready[0].unique_buyers == 5
+    assert ready[0].ws_buyers == 0
+    assert ready[0].buyers_inferred is True
     assert skips == []
     assert seen_auth
     assert all(value == "" for value in seen_auth)
@@ -730,6 +732,8 @@ async def test_coin_card_real_sol_alone_promotes_when_trades_empty():
     ready = mon.sweep()
     assert [t.mint for t in ready] == ["A"]
     assert ready[0].unique_buyers == 5
+    assert ready[0].ws_buyers == 0
+    assert ready[0].buyers_inferred is True
     assert skips == []
 
 

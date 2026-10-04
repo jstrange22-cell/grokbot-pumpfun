@@ -3,6 +3,35 @@
 Формат: что изменилось и почему это имело значение. Версии — по смыслу, а
 не по расписанию.
 
+## 0.4.6 — 2026-08-30
+
+- **Live buy failed Instruction 3 custom 0x17ae (6062 BuybackFeeRecipientMissing).**
+  Classic `buy`/`sell` keys ended at `fee_config` + FEE_PROGRAM. The Apr/May
+  2026 pump.fun upgrade requires two trailing remaining accounts on both
+  sides: `bonding_curve_v2` PDA (readonly, seeds `[b"bonding-curve-v2", mint]`)
+  and buyback fee recipient `5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD`
+  (writable). Existing account order is unchanged. Envelope unchanged:
+  0.05 SOL/clip, 1 seat, Grok veto off, 0.1 SOL/day max loss.
+
+## 0.4.5 — 2026-08-30
+
+- **Four Grok agents per coin burned the daily xAI budget at 0 fills.**
+  v3 `/trades` and `/holders` 404 without a site JWT; the 0.4.4 coin-card
+  promote still sent every weak launch to auditor + narrative + timing +
+  checker. Restart restored `grok_calls=2000` from `pipeline.json`, every
+  agent failed `daily call budget exhausted`, and the book sat at 0 buys.
+  Entry is now mechanical: WS buyers, bonding curve, public `/coins/{mint}`.
+  A 0.05 clip can fire with Grok off. `ops.grok_entry_veto` (default
+  **false**) is at most one checker call after a mechanical pass. Exhausted
+  budget or an open breaker skips the veto and still trades. Envelope
+  unchanged: 0.05 SOL/clip, 1 seat, 0.1 SOL/day max loss.
+- **`daily_loss_limit_sol: 0` is not unlimited.** `halted` is
+  `daily_loss >= limit`, so 0 >= 0 stops the book. 0 is coerced to the
+  envelope 0.1 SOL/day. Negative values still fail startup.
+- Coin-card inferred buyers (`last_trade` / reserve) no longer count as
+  `ws_buyers`. Mechanical traction haircuts that path so a 404 tape does
+  not look like 12 organic wallets.
+
 ## 0.4.4 — 2026-08-30
 
 - **Monitor still never promoted after 0.4.3.** `unique_buyers` stayed 0

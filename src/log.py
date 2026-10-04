@@ -165,7 +165,7 @@ class TradeLog:
         })
 
     def promote(self, token: Token, *, detail: str | None = None) -> dict[str, Any]:
-        """Лонч прошёл монитор. Дальше — анализатор и, если повезёт, Grok."""
+        """Лонч прошёл монитор. Дальше — анализатор и механический скоринг."""
         return self._write(
             {
                 "type": "promote",

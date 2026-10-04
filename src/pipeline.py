@@ -1,12 +1,12 @@
 """Оркестратор: связывает все ступени в один поток.
 
-    монитор → анализатор → аудитор → нарратив → тайминг → скоринг →
-    чекер → риск-гейт → исполнение
+    монитор → анализатор → механический скоринг → риск-гейт →
+    (опционально одно вето Grok) → исполнение
 
-Каждая ступень либо пропускает токен дальше, либо пишет skip с причиной и
-на этом заканчивает. Дорогие ступени стоят после дешёвых: до grok-4
-доходит только то, что пережило фильтр кодом, метрики, трёх быстрых
-агентов и скоринговый порог.
+Вход считает код: покупатели с WS, кривая, публичная карточка /coins.
+Grok по умолчанию выключен. Если `ops.grok_entry_veto`, после механического
+прохода зовётся один чекер; исчерпанный бюджет вето пропускает, книгу
+не стопорит. Четыре агента на каждый лонч — это баг, не режим.
 
 Процесс рассчитан на то, чтобы жить сутками: состояние переживает
 рестарт, SIGTERM останавливает аккуратно, расход Grok ограничен, живость
@@ -52,7 +52,7 @@ from .ops import (
 )
 from .reputation import ReputationBook
 from .risk import PositionWatcher, RiskManager, Tick
-from .scoring import compute_scores, passes_threshold, weakest_component
+from .scoring import compute_mechanical_scores, passes_threshold, weakest_component
 from .state import InstanceLock, StateStore
 
 log = logging.getLogger("pipeline")
@@ -297,7 +297,7 @@ class Pipeline:
 
         # 2. Анализатор: сеть параллельно, метрики кодом.
         # Пустой REST-tape не вето, если монитор уже набрал unique_buyers.
-        holders, trades, curve, metrics = await self.analyzer.inspect(token)
+        _holders, _trades, curve, metrics = await self.analyzer.inspect(token)
         analysis = Analysis(token=token, metrics=metrics, curve=curve)
 
         ok, reason = self.analyzer.passes(metrics, token)
@@ -305,40 +305,31 @@ class Pipeline:
             return self._reject(analysis, stage="analyzer", reason=reason,
                                 detail=f"risk_score={metrics.risk_score}")
 
-        # 3-5. Быстрые агенты параллельно. Тайминг обычно берётся из кэша.
-        analysis.audit, analysis.narrative, analysis.timing = await asyncio.gather(
-            self.auditor.run(token, trades, holders, metrics),
-            self.narrative.run(token),
-            self.timing.get(self._market_snapshot()),
-        )
-
-        # 6. Скоринг кодом.
-        analysis.scores = compute_scores(analysis, self.config)
+        # 3. Механический скоринг. Grok сюда не входит: пустые /trades и
+        # /holders не стоят четырёх вызовов xAI.
+        analysis.scores = compute_mechanical_scores(analysis, self.config)
         ok, reason = passes_threshold(analysis.scores, self.config)
         if not ok:
             name, value = weakest_component(analysis.scores)
             return self._reject(analysis, stage="scoring", reason=reason,
                                 detail=f"слабее всего {name}={value:.3f}")
 
-        # План сделки считается до чекера: ему нужно видеть, во что
-        # обойдётся вход и выход, а не только то, как хорош токен.
         liquidity_cap = (
             max_sol_for_impact(curve, self.config.market.max_price_impact_pct,
                                self.config.market.trade_fee_pct)
             if curve else 0.0
         )
         analysis.plan = self.risk.evaluate(token.mint, analysis.scores.total, liquidity_cap)
+        if not analysis.plan.approved:
+            return self._reject(analysis, stage="risk", reason=analysis.plan.reason)
 
-        # 7. Адверсариальный чекер на сильной модели.
-        analysis.checker = await self.checker.run(analysis)
-        if not analysis.checker.approve:
-            return self._reject(
-                analysis, stage="checker", reason="checker_rejected",
-                detail=f"{analysis.checker.reason} [{', '.join(analysis.checker.flags)}]",
-            )
+        # 4. Одно опциональное вето Grok после механического прохода.
+        # Выключено по умолчанию. Исчерпанный бюджет / разомкнутая цепь
+        # вето пропускают — книга торгует дальше.
+        if not await self._optional_grok_veto(analysis):
+            return None
 
-        # 8. Риск-гейт. Пересчитывается после чекера: пока сильная модель
-        # думала, могли открыться другие позиции и лимиты поменялись.
+        # 5. Риск-гейт ещё раз: пока чекер думал, лимиты могли сдвинуться.
         decision = self.risk.evaluate(token.mint, analysis.scores.total, liquidity_cap)
         if not decision.approved:
             return self._reject(analysis, stage="risk", reason=decision.reason)
@@ -385,6 +376,30 @@ class Pipeline:
         )
         return analysis
 
+    async def _optional_grok_veto(self, analysis: Analysis) -> bool:
+        """True — идём к покупке. False — уже записали skip.
+
+        Grok по умолчанию не зовём. Одно вето, и только если бюджет жив.
+        """
+        if not self.config.ops.grok_entry_veto:
+            return True
+        ready, why = self.grok_ops.entry_veto_ready()
+        if not ready:
+            log.info(
+                "вето Grok пропущено для %s: %s — вход остаётся механическим",
+                analysis.token.mint[:8], why,
+            )
+            self.metrics.inc(f"grok_veto_skipped_{why}")
+            return True
+        analysis.checker = await self.checker.run(analysis)
+        if analysis.checker.approve:
+            return True
+        self._reject(
+            analysis, stage="checker", reason="checker_rejected",
+            detail=f"{analysis.checker.reason} [{', '.join(analysis.checker.flags)}]",
+        )
+        return False
+
     def _reject(
         self, analysis: Analysis, *, stage: str, reason: str, detail: str | None = None
     ) -> Analysis | None:
@@ -416,8 +431,8 @@ class Pipeline:
         edges = {
             "breaker": (
                 status["breaker"] == "open",
-                "цепь Grok разомкнута — пайплайн не покупает",
-                "цепь Grok замкнулась, работа продолжается",
+                "цепь Grok разомкнута — вето пропущено, вход механический",
+                "цепь Grok замкнулась, вето снова доступно",
             ),
             "halted": (
                 bool(status["halted"]),
@@ -480,10 +495,10 @@ class Pipeline:
         одинаково. Без этой пометки подбор весов по логу сравнивает
         решения двух разных ботов.
         """
-        return {
-            agent.name: agent.version
-            for agent in (self.auditor, self.narrative, self.timing, self.checker)
-        }
+        versions = {"entry": "mechanical"}
+        if self.config.ops.grok_entry_veto:
+            versions["checker"] = self.checker.version
+        return versions
 
     def _sync_counters(self) -> None:
         """Перенести расход Grok в состояние, которое ляжет на диск."""

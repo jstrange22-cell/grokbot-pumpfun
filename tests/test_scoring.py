@@ -14,7 +14,13 @@ from src.models import (
     Token,
     TokenMetrics,
 )
-from src.scoring import compute_scores, normalized_weights, passes_threshold, weakest_component
+from src.scoring import (
+    compute_mechanical_scores,
+    compute_scores,
+    normalized_weights,
+    passes_threshold,
+    weakest_component,
+)
 
 
 @pytest.fixture
@@ -163,3 +169,51 @@ def test_threshold_boundary_is_inclusive(config):
 def test_weakest_component_named():
     name, value = weakest_component(Scores(audit=0.9, narrative=0.2, timing=0.8, metrics=0.7))
     assert (name, value) == ("narrative", 0.2)
+
+
+# --- механический вход ----------------------------------------------------
+
+
+def test_mechanical_score_passes_on_ws_traction(config):
+    """Живые покупатели + кривая + низкий риск — клип без Grok."""
+    analysis = Analysis(
+        token=Token(mint="M", unique_buyers=12, ws_buyers=12),
+        metrics=TokenMetrics(
+            risk_score=2.0,
+            curve_liquidity_sol=15.0,
+            curve_health=0.7,
+            unique_wallets=12,
+            social_signals=0.8,
+        ),
+    )
+    scores = compute_mechanical_scores(analysis, config)
+    ok, _ = passes_threshold(scores, config)
+    assert ok
+    assert scores.total >= 0.65
+
+
+def test_mechanical_score_haircuts_inferred_card_buyers(config):
+    """404 /trades: unique_buyers с карточки не равны 12 живым кошелькам."""
+    inferred = Analysis(
+        token=Token(mint="M", unique_buyers=5, ws_buyers=0, buyers_inferred=True),
+        metrics=TokenMetrics(
+            risk_score=4.0,
+            curve_liquidity_sol=15.0,
+            unique_wallets=5,
+            trade_count=5,
+        ),
+    )
+    live = Analysis(
+        token=Token(mint="N", unique_buyers=12, ws_buyers=12),
+        metrics=TokenMetrics(
+            risk_score=4.0,
+            curve_liquidity_sol=15.0,
+            unique_wallets=12,
+            trade_count=12,
+        ),
+    )
+    weak = compute_mechanical_scores(inferred, config)
+    strong = compute_mechanical_scores(live, config)
+    assert weak.audit < strong.audit
+    assert weak.total < strong.total
+    assert not passes_threshold(weak, config)[0]

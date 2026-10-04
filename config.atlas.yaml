@@ -107,3 +107,6 @@ ops:
   grok_calls_per_minute: 60
   breaker_failures: 8
   breaker_cooldown_seconds: 120
+  # Entry is mechanical (WS buyers, curve, public /coins). Grok is at most
+  # one veto after a pass. Default off — SuperGrok is not a pump.fun sweeper.
+  grok_entry_veto: false

@@ -212,6 +212,11 @@ class CallBudget:
         self._roll()
         return max(0, self.max_per_day - self.spent)
 
+    def can_spend(self, amount: int = 1) -> bool:
+        """Хватает ли бюджета, не списывая вызов."""
+        self._roll()
+        return self.spent + amount <= self.max_per_day
+
     def try_spend(self, amount: int = 1) -> bool:
         self._roll()
         if self.spent + amount > self.max_per_day:
@@ -244,6 +249,14 @@ class GrokOps:
         self.semaphore = asyncio.Semaphore(max(1, ops.grok_max_concurrency))
         self.tokens_in = 0
         self.tokens_out = 0
+
+    def entry_veto_ready(self) -> tuple[bool, str]:
+        """Можно ли вызвать одно вето на вход. Не списывает бюджет."""
+        if self.breaker.is_open:
+            return False, "grok_breaker_open"
+        if not self.budget.can_spend():
+            return False, "grok_budget_exhausted"
+        return True, "ok"
 
     def precheck(self, agent: str) -> str | None:
         """Причина не звонить в Grok прямо сейчас, или None."""

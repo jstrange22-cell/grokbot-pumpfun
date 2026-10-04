@@ -60,10 +60,11 @@ def test_good_config_passes(config):
     assert statuses[0] == OK
 
 
-def test_placeholder_key_fails():
+def test_placeholder_key_warns_when_veto_off():
+    """Механический вход стартует без ключа; вето выключено."""
     checks = check_config(Config())
-    assert checks[0].status == FAIL
-    assert "api_key" in checks[0].detail
+    assert checks[0].status == OK
+    assert any(c.status == WARN and "api_key" in c.detail for c in checks)
 
 
 def test_warnings_do_not_fail(config):

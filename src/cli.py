@@ -37,7 +37,7 @@ SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="grokbot",
-        description="Пайплайн мемкоин-трейдинга на pump.fun с агентами на Grok",
+        description="Пайплайн pump.fun: механический вход, опциональное вето Grok",
     )
     sub = parser.add_subparsers(dest="command")
 
